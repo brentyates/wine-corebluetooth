@@ -1,12 +1,13 @@
 MODULE  = winebth.sys
 IMPORTS = ntoskrnl uuid
 UNIXLIB = winebth.so
-UNIX_CFLAGS = $(DBUS_CFLAGS)
-UNIX_LIBS = $(PTHREAD_LIBS)
+UNIX_CFLAGS = $(DBUS_CFLAGS) $(COREBLUETOOTH_CFLAGS)
+UNIX_LIBS = $(PTHREAD_LIBS) $(COREBLUETOOTH_LIBS)
 
 EXTRADLLFLAGS = -Wl,--subsystem,native
 
 SOURCES = \
+	corebth.m \
 	dbus.c \
 	unixlib.c \
 	winebluetooth.c \

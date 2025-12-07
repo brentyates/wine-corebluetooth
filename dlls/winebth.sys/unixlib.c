@@ -107,6 +107,28 @@ static NTSTATUS bluetooth_init ( void *params )
 {
     NTSTATUS status;
 
+#ifdef __APPLE__
+    dbus_connection = corebth_init();
+    if (!dbus_connection)
+        return STATUS_INTERNAL_ERROR;
+
+    status = corebth_auth_agent_start( dbus_connection, &bluetooth_auth_agent );
+    if (status)
+    {
+        corebth_close( dbus_connection );
+        return status;
+    }
+
+    status = corebth_watcher_init( dbus_connection, &bluetooth_watcher );
+    if (status)
+    {
+        corebth_auth_agent_stop( dbus_connection, bluetooth_auth_agent );
+        corebth_close( dbus_connection );
+    }
+    else
+        TRACE( "corebth_connection=%p bluetooth_watcher=%p bluetooth_auth_agent=%p\n", dbus_connection, bluetooth_watcher,
+               bluetooth_auth_agent );
+#else
     dbus_connection = bluez_dbus_init();
     if (!dbus_connection)
         return STATUS_INTERNAL_ERROR;
@@ -127,6 +149,7 @@ static NTSTATUS bluetooth_init ( void *params )
     else
         TRACE( "dbus_connection=%p bluetooth_watcher=%p bluetooth_auth_agent=%p\n", dbus_connection, bluetooth_watcher,
                bluetooth_auth_agent );
+#endif
     return status;
 }
 
@@ -134,10 +157,17 @@ static NTSTATUS bluetooth_shutdown( void *params )
 {
     if (!dbus_connection) return STATUS_NOT_SUPPORTED;
 
+#ifdef __APPLE__
+    corebth_auth_agent_stop( dbus_connection, bluetooth_auth_agent );
+    corebth_close( dbus_connection );
+    corebth_watcher_close( dbus_connection, bluetooth_watcher );
+    corebth_free( dbus_connection );
+#else
     bluez_auth_agent_stop( dbus_connection, bluetooth_auth_agent );
     bluez_dbus_close( dbus_connection );
     bluez_watcher_close( dbus_connection, bluetooth_watcher );
     bluez_dbus_free( dbus_connection );
+#endif
     return STATUS_SUCCESS;
 }
 
@@ -189,7 +219,11 @@ static NTSTATUS bluetooth_adapter_set_prop( void *arg )
     struct bluetooth_adapter_set_prop_params *params = arg;
 
     if (!dbus_connection) return STATUS_NOT_SUPPORTED;
+#ifdef __APPLE__
+    return corebth_adapter_set_prop( dbus_connection, params );
+#else
     return bluez_adapter_set_prop( dbus_connection, params );
+#endif
 }
 
 static NTSTATUS bluetooth_device_free( void *args )
@@ -211,7 +245,11 @@ static NTSTATUS bluetooth_adapter_start_discovery( void *args )
     struct bluetooth_adapter_start_discovery_params *params = args;
 
     if (!dbus_connection) return STATUS_NOT_SUPPORTED;
+#ifdef __APPLE__
+    return corebth_adapter_start_discovery( dbus_connection, params->adapter->str );
+#else
     return bluez_adapter_start_discovery( dbus_connection, params->adapter->str );
+#endif
 }
 
 static NTSTATUS bluetooth_adapter_stop_discovery( void *args )
@@ -219,7 +257,11 @@ static NTSTATUS bluetooth_adapter_stop_discovery( void *args )
     struct bluetooth_adapter_stop_discovery_params *params = args;
 
     if (!dbus_connection) return STATUS_NOT_SUPPORTED;
+#ifdef __APPLE__
+    return corebth_adapter_stop_discovery( dbus_connection, params->adapter->str );
+#else
     return bluez_adapter_stop_discovery( dbus_connection, params->adapter->str );
+#endif
 }
 
 
@@ -228,13 +270,21 @@ static NTSTATUS bluetooth_adapter_remove_device( void *args )
     struct bluetooth_adapter_remove_device_params *params = args;
 
     if (!dbus_connection) return STATUS_NOT_SUPPORTED;
+#ifdef __APPLE__
+    return corebth_adapter_remove_device( dbus_connection, params->adapter->str, params->device->str );
+#else
     return bluez_adapter_remove_device( dbus_connection, params->adapter->str, params->device->str );
+#endif
 }
 
 static NTSTATUS bluetooth_auth_agent_enable_incoming( void *args )
 {
     if (!dbus_connection) return STATUS_NOT_SUPPORTED;
+#ifdef __APPLE__
+    return corebth_auth_agent_request_default( dbus_connection );
+#else
     return bluez_auth_agent_request_default( dbus_connection );
+#endif
 }
 
 static NTSTATUS bluetooth_auth_send_response( void *args )
@@ -242,8 +292,13 @@ static NTSTATUS bluetooth_auth_send_response( void *args )
     struct bluetooth_auth_send_response_params *params = args;
 
     if (!dbus_connection) return STATUS_NOT_SUPPORTED;
+#ifdef __APPLE__
+    return corebth_auth_agent_send_response( bluetooth_auth_agent, params->device, params->method,
+                                             params->numeric_or_passkey, params->negative, params->authenticated );
+#else
     return bluez_auth_agent_send_response( bluetooth_auth_agent, params->device, params->method,
                                            params->numeric_or_passkey, params->negative, params->authenticated );
+#endif
 }
 
 static NTSTATUS bluetooth_device_disconnect( void *args )
@@ -251,7 +306,11 @@ static NTSTATUS bluetooth_device_disconnect( void *args )
     struct bluetooth_device_disconnect_params *params = args;
 
     if (!dbus_connection) return STATUS_NOT_SUPPORTED;
+#ifdef __APPLE__
+    return corebth_device_disconnect( dbus_connection, params->device->str );
+#else
     return bluez_device_disconnect( dbus_connection, params->device->str );
+#endif
 }
 
 static NTSTATUS bluetooth_device_start_pairing( void *args )
@@ -259,7 +318,11 @@ static NTSTATUS bluetooth_device_start_pairing( void *args )
     struct bluetooth_device_start_pairing_params *params = args;
 
     if (!dbus_connection) return STATUS_NOT_SUPPORTED;
+#ifdef __APPLE__
+    return corebth_device_start_pairing( dbus_connection, bluetooth_watcher, params->device, params->irp );
+#else
     return bluez_device_start_pairing( dbus_connection, bluetooth_watcher, params->device, params->irp );
+#endif
 }
 
 static NTSTATUS bluetooth_gatt_service_free( void *args )
@@ -283,7 +346,11 @@ static NTSTATUS bluetooth_get_event( void *args )
 
     if (!dbus_connection) return STATUS_NOT_SUPPORTED;
     memset( &params->result, 0, sizeof( params->result ) );
+#ifdef __APPLE__
+    return corebth_loop( dbus_connection, bluetooth_watcher, bluetooth_auth_agent, &params->result );
+#else
     return bluez_dbus_loop( dbus_connection, bluetooth_watcher, bluetooth_auth_agent, &params->result );
+#endif
 }
 
 const unixlib_entry_t __wine_unix_call_funcs[] = {

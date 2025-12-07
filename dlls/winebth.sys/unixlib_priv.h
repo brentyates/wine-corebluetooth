@@ -65,4 +65,30 @@ extern NTSTATUS bluez_device_disconnect( void *connection, const char *device_pa
 extern NTSTATUS bluez_device_start_pairing( void *dbus_connection, void *watcher_ctx, struct unix_name *device, IRP *irp );
 extern NTSTATUS bluez_watcher_init( void *connection, void **ctx );
 extern void bluez_watcher_close( void *connection, void *ctx );
+
+#ifdef __APPLE__
+typedef int corebth_status;
+extern void *corebth_init( void );
+extern void corebth_close( void *connection );
+extern void corebth_free( void *connection );
+extern corebth_status corebth_loop( void *connection, void *watcher_ctx, void *auth_agent,
+                                    void *result );
+extern corebth_status corebth_adapter_set_prop( void *connection, void *params );
+extern corebth_status corebth_adapter_start_discovery( void *connection, const char *adapter_path );
+extern corebth_status corebth_adapter_stop_discovery( void *connection, const char *adapter_path );
+extern corebth_status corebth_adapter_remove_device( void *connection, const char *adapter_path,
+                                                     const char *device_path );
+extern corebth_status corebth_auth_agent_request_default( void *connection );
+extern corebth_status corebth_auth_agent_start( void *connection, void **ctx );
+extern void corebth_auth_agent_stop( void *connection, void *ctx );
+extern corebth_status corebth_auth_agent_send_response( void *auth_agent, void *device,
+                                                        int method, unsigned int numeric_or_passkey,
+                                                        int negative, int *authenticated );
+extern corebth_status corebth_device_disconnect( void *connection, const char *device_path );
+extern corebth_status corebth_device_start_pairing( void *connection, void *watcher_ctx,
+                                                    void *device, void *irp );
+extern corebth_status corebth_watcher_init( void *connection, void **ctx );
+extern void corebth_watcher_close( void *connection, void *ctx );
+#endif /* __APPLE__ */
+
 #endif /* __WINE_WINEBTH_UNIXLIB_PRIV_H */
