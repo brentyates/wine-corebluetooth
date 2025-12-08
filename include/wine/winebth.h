@@ -40,6 +40,12 @@
 #define IOCTL_WINEBTH_LE_DEVICE_GET_GATT_SERVICES CTL_CODE(FILE_DEVICE_BLUETOOTH, 0xc0, METHOD_BUFFERED, FILE_ANY_ACCESS)
 /* Get all characteristics for a GATT service */
 #define IOCTL_WINEBTH_LE_DEVICE_GET_GATT_CHARACTERISTICS CTL_CODE(FILE_DEVICE_BLUETOOTH, 0xc1, METHOD_BUFFERED, FILE_ANY_ACCESS)
+/* Read a characteristic value */
+#define IOCTL_WINEBTH_LE_DEVICE_READ_CHARACTERISTIC CTL_CODE(FILE_DEVICE_BLUETOOTH, 0xc2, METHOD_BUFFERED, FILE_ANY_ACCESS)
+/* Write a characteristic value */
+#define IOCTL_WINEBTH_LE_DEVICE_WRITE_CHARACTERISTIC CTL_CODE(FILE_DEVICE_BLUETOOTH, 0xc3, METHOD_BUFFERED, FILE_ANY_ACCESS)
+/* Enable/disable notifications for a characteristic */
+#define IOCTL_WINEBTH_LE_DEVICE_SET_NOTIFY CTL_CODE(FILE_DEVICE_BLUETOOTH, 0xc4, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 DEFINE_GUID( GUID_WINEBTH_AUTHENTICATION_REQUEST, 0xca67235f, 0xf621, 0x4c27, 0x85, 0x65, 0xa4,
              0xd5, 0x5e, 0xa1, 0x26, 0xe8 );
@@ -91,6 +97,30 @@ struct winebth_le_device_get_gatt_characteristics_params
     BTH_LE_GATT_SERVICE service;
     ULONG count;
     BTH_LE_GATT_CHARACTERISTIC characteristics[0];
+};
+
+struct winebth_le_device_read_characteristic_params
+{
+    BTH_LE_GATT_SERVICE service;
+    BTH_LE_GATT_CHARACTERISTIC characteristic;
+    ULONG data_size;
+    UCHAR data[0];
+};
+
+struct winebth_le_device_write_characteristic_params
+{
+    BTH_LE_GATT_SERVICE service;
+    BTH_LE_GATT_CHARACTERISTIC characteristic;
+    ULONG write_type;
+    ULONG data_size;
+    UCHAR data[0];
+};
+
+struct winebth_le_device_set_notify_params
+{
+    BTH_LE_GATT_SERVICE service;
+    BTH_LE_GATT_CHARACTERISTIC characteristic;
+    BOOL enable;
 };
 
 #pragma pack(pop)

@@ -469,10 +469,36 @@ namespace Windows.Devices.Bluetooth {
     }
 
     [
+        contract(Windows.Foundation.UniversalApiContract, 2.0),
+        exclusiveto(Windows.Devices.Bluetooth.BluetoothLEDevice),
+        uuid(5f12c06b-3bac-43e8-ad16-563271bd41c2)
+    ]
+    interface IBluetoothLEDeviceStatics2 : IInspectable
+    {
+        HRESULT GetDeviceSelectorFromPairingState([in] boolean paired,
+                                                  [out, retval] HSTRING *result);
+        HRESULT GetDeviceSelectorFromConnectionStatus([in] Windows.Devices.Bluetooth.BluetoothConnectionStatus status,
+                                                      [out, retval] HSTRING *result);
+        HRESULT GetDeviceSelectorFromDeviceName([in] HSTRING name,
+                                                [out, retval] HSTRING *result);
+        HRESULT GetDeviceSelectorFromBluetoothAddress([in] UINT64 addr,
+                                                      [out, retval] HSTRING *result);
+        HRESULT GetDeviceSelectorFromBluetoothAddressWithBluetoothAddressType([in] UINT64 addr,
+                                                                              [in] Windows.Devices.Bluetooth.BluetoothAddressType type,
+                                                                              [out, retval] HSTRING *result);
+        /* HRESULT GetDeviceSelectorFromAppearance([in] Windows.Devices.Bluetooth.BluetoothLEAppearance *appearance,
+                                                [out, retval] HSTRING *result); */
+        [overload("FromBluetoothAddressAsync")]
+        HRESULT FromBluetoothAddressWithBluetoothAddressTypeAsync([in] UINT64 addr,
+                                                                  [in] Windows.Devices.Bluetooth.BluetoothAddressType type,
+                                                                  [out, retval] Windows.Foundation.IAsyncOperation<Windows.Devices.Bluetooth.BluetoothLEDevice *> **async);
+    }
+
+    [
         contract(Windows.Foundation.UniversalApiContract, 1.0),
         marshaling_behavior(agile),
         static(Windows.Devices.Bluetooth.IBluetoothLEDeviceStatics, Windows.Foundation.UniversalApiContract, 1.0),
-        /* static(Windows.Devices.Bluetooth.IBluetoothLEDeviceStatics2, Windows.Foundation.UniversalApiContract, 2.0), */
+        static(Windows.Devices.Bluetooth.IBluetoothLEDeviceStatics2, Windows.Foundation.UniversalApiContract, 2.0),
         threading(both)
     ]
     runtimeclass BluetoothLEDevice

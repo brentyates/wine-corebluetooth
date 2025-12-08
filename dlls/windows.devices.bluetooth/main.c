@@ -34,19 +34,42 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
 {
     const WCHAR *buffer = WindowsGetStringRawBuffer( classid, NULL );
 
-    TRACE( "class %s, factory %p.\n", debugstr_hstring(classid), factory );
+    ERR( "=== DllGetActivationFactory CALLED === class %s\n", debugstr_w(buffer) );
 
     *factory = NULL;
 
     if (!wcscmp( buffer, RuntimeClass_Windows_Devices_Bluetooth_BluetoothAdapter ))
+    {
+        ERR( "MATCH: BluetoothAdapter\n" );
         IActivationFactory_QueryInterface( bluetoothadapter_factory, &IID_IActivationFactory, (void **)factory );
+    }
     if (!wcscmp( buffer, RuntimeClass_Windows_Devices_Bluetooth_BluetoothDevice ))
+    {
+        ERR( "MATCH: BluetoothDevice\n" );
         IActivationFactory_QueryInterface( bluetoothdevice_statics_factory, &IID_IActivationFactory, (void **)factory );
+    }
     if (!wcscmp( buffer, RuntimeClass_Windows_Devices_Bluetooth_BluetoothLEDevice ))
+    {
+        ERR( "MATCH: BluetoothLEDevice\n" );
         IActivationFactory_QueryInterface( bluetoothledevice_statics_factory, &IID_IActivationFactory, (void **)factory );
-    if (!wcscmp( buffer, RuntimeClass_Windows_Devices_Bluetooth_Advertisement_BluetoothLEAdvertisementWatcher))
+    }
+    if (!wcscmp( buffer, RuntimeClass_Windows_Devices_Bluetooth_Advertisement_BluetoothLEAdvertisementWatcher ))
+    {
+        ERR( "MATCH: BluetoothLEAdvertisementWatcher\n" );
         IActivationFactory_QueryInterface( advertisement_watcher_factory, &IID_IActivationFactory, (void **)factory );
+    }
+    if (!wcscmp( buffer, RuntimeClass_Windows_Devices_Bluetooth_Advertisement_BluetoothLEAdvertisementFilter ))
+    {
+        ERR( "MATCH: BluetoothLEAdvertisementFilter, factory=%p\n", advertisement_filter_factory );
+        IActivationFactory_QueryInterface( advertisement_filter_factory, &IID_IActivationFactory, (void **)factory );
+    }
+    if (!wcscmp( buffer, RuntimeClass_Windows_Devices_Bluetooth_Advertisement_BluetoothLEAdvertisement ))
+    {
+        ERR( "MATCH: BluetoothLEAdvertisement, factory=%p\n", advertisement_factory );
+        IActivationFactory_QueryInterface( advertisement_factory, &IID_IActivationFactory, (void **)factory );
+    }
 
+    ERR( "=== Result: factory=%p ===\n", *factory );
     if (*factory) return S_OK;
     return CLASS_E_CLASSNOTAVAILABLE;
 }

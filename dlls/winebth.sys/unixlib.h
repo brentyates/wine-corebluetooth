@@ -74,6 +74,28 @@ struct bluetooth_gatt_characteristic_free_params
     unix_name_t characteristic;
 };
 
+struct bluetooth_gatt_characteristic_read_params
+{
+    unix_name_t characteristic;
+    unsigned char *buffer;
+    unsigned int buffer_size;
+    unsigned int *data_len;
+};
+
+struct bluetooth_gatt_characteristic_write_params
+{
+    unix_name_t characteristic;
+    const unsigned char *data;
+    unsigned int size;
+    int write_type;
+};
+
+struct bluetooth_gatt_characteristic_set_notify_params
+{
+    unix_name_t characteristic;
+    int enable;
+};
+
 struct bluetooth_device_disconnect_params
 {
     unix_name_t device;
@@ -155,6 +177,9 @@ enum bluetoothapis_funcs
     unix_bluetooth_gatt_service_free,
 
     unix_bluetooth_gatt_characteristic_free,
+    unix_bluetooth_gatt_characteristic_read,
+    unix_bluetooth_gatt_characteristic_write,
+    unix_bluetooth_gatt_characteristic_set_notify,
 
     unix_bluetooth_get_event,
 

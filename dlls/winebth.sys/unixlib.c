@@ -37,12 +37,21 @@
 #include <windef.h>
 #include <wine/list.h>
 #include <wine/rbtree.h>
+#define WINE_NO_DEBUG_MSGS
 #include <wine/debug.h>
 
 #include "unixlib.h"
 #include "unixlib_priv.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL( winebth );
+
+/* Provide minimal stubs to satisfy debug symbols on host build */
+int __wine_dbg_output( const char *str ) { (void)str; return 0; }
+int __wine_dbg_header( enum __wine_debug_class cls, struct __wine_debug_channel *channel, const char *function )
+{
+    (void)cls; (void)channel; (void)function;
+    return 0;
+}
 
 static int compare_string( const void *key, const struct wine_rb_entry *entry )
 {
@@ -316,10 +325,20 @@ static NTSTATUS bluetooth_device_disconnect( void *args )
 static NTSTATUS bluetooth_device_start_pairing( void *args )
 {
     struct bluetooth_device_start_pairing_params *params = args;
+    NTSTATUS status;
 
-    if (!dbus_connection) return STATUS_NOT_SUPPORTED;
+    fprintf(stderr, "Wine: bluetooth_device_start_pairing called, dbus_connection=%p device=%p irp=%p\n",
+            dbus_connection, (void *)params->device, params->irp);
+
+    if (!dbus_connection)
+    {
+        fprintf(stderr, "Wine: bluetooth_device_start_pairing: dbus_connection is NULL!\n");
+        return STATUS_NOT_SUPPORTED;
+    }
 #ifdef __APPLE__
-    return corebth_device_start_pairing( dbus_connection, bluetooth_watcher, params->device, params->irp );
+    status = corebth_device_start_pairing( dbus_connection, bluetooth_watcher, params->device, params->irp );
+    fprintf(stderr, "Wine: corebth_device_start_pairing returned 0x%lx\n", (unsigned long)status);
+    return status;
 #else
     return bluez_device_start_pairing( dbus_connection, bluetooth_watcher, params->device, params->irp );
 #endif
@@ -339,6 +358,44 @@ static NTSTATUS bluetooth_gatt_characteristic_free( void *args )
     return STATUS_SUCCESS;
 }
 
+static NTSTATUS bluetooth_gatt_characteristic_read( void *args )
+{
+    struct bluetooth_gatt_characteristic_read_params *params = args;
+
+    if (!dbus_connection) return STATUS_NOT_SUPPORTED;
+#ifdef __APPLE__
+    return corebth_characteristic_read( dbus_connection, params->characteristic->str,
+                                        params->buffer, params->buffer_size, params->data_len );
+#else
+    return STATUS_NOT_IMPLEMENTED;
+#endif
+}
+
+static NTSTATUS bluetooth_gatt_characteristic_write( void *args )
+{
+    struct bluetooth_gatt_characteristic_write_params *params = args;
+
+    if (!dbus_connection) return STATUS_NOT_SUPPORTED;
+#ifdef __APPLE__
+    return corebth_characteristic_write( dbus_connection, params->characteristic->str,
+                                         params->data, params->size, params->write_type );
+#else
+    return STATUS_NOT_IMPLEMENTED;
+#endif
+}
+
+static NTSTATUS bluetooth_gatt_characteristic_set_notify( void *args )
+{
+    struct bluetooth_gatt_characteristic_set_notify_params *params = args;
+
+    if (!dbus_connection) return STATUS_NOT_SUPPORTED;
+#ifdef __APPLE__
+    return corebth_characteristic_set_notify( dbus_connection, params->characteristic->str,
+                                              params->enable );
+#else
+    return STATUS_NOT_IMPLEMENTED;
+#endif
+}
 
 static NTSTATUS bluetooth_get_event( void *args )
 {
@@ -376,6 +433,9 @@ const unixlib_entry_t __wine_unix_call_funcs[] = {
     bluetooth_gatt_service_free,
 
     bluetooth_gatt_characteristic_free,
+    bluetooth_gatt_characteristic_read,
+    bluetooth_gatt_characteristic_write,
+    bluetooth_gatt_characteristic_set_notify,
 
     bluetooth_get_event,
 };

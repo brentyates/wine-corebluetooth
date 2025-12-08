@@ -89,6 +89,14 @@ extern corebth_status corebth_device_start_pairing( void *connection, void *watc
                                                     void *device, void *irp );
 extern corebth_status corebth_watcher_init( void *connection, void **ctx );
 extern void corebth_watcher_close( void *connection, void *ctx );
+extern corebth_status corebth_characteristic_read( void *connection, const char *char_path,
+                                                   unsigned char *buffer, unsigned int buffer_size,
+                                                   unsigned int *size );
+extern corebth_status corebth_characteristic_write( void *connection, const char *char_path,
+                                                    const unsigned char *data, unsigned int size,
+                                                    int write_type );
+extern corebth_status corebth_characteristic_set_notify( void *connection, const char *char_path,
+                                                         int enable );
 #endif /* __APPLE__ */
 
 #endif /* __WINE_WINEBTH_UNIXLIB_PRIV_H */
