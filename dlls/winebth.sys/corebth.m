@@ -187,6 +187,14 @@ struct corebth_device_removed_event
     struct corebth_device device;
 };
 
+struct corebth_device_props_changed_event
+{
+    uint16_t changed_props_mask;
+    struct corebth_device_props props;
+    uint16_t invalid_props_mask;
+    struct corebth_device device;
+};
+
 struct corebth_gatt_service
 {
     uintptr_t handle;
@@ -231,6 +239,7 @@ struct corebth_watcher_event
         struct corebth_radio radio_removed;
         struct corebth_device_added_event device_added;
         struct corebth_device_removed_event device_removed;
+        struct corebth_device_props_changed_event device_props_changed;
         struct corebth_gatt_service_added_event gatt_service_added;
         struct corebth_gatt_service_removed_event gatt_service_removed;
         struct corebth_gatt_char_added_event gatt_char_added;
@@ -259,9 +268,13 @@ struct corebth_peripheral_entry
     struct unix_name *name;
     uintptr_t handle;
     char uuid_string[64];
+    char friendly_name[BLUETOOTH_MAX_NAME_SIZE];
+    int has_local_name;
     struct corebth_service_entry *services;
     uint16_t next_service_handle;
-    id peripheral_delegate;
+    void *peripheral_delegate;
+    dispatch_semaphore_t services_discovered;
+    int services_discovery_complete;
 };
 
 struct corebth_char_entry;
@@ -466,6 +479,8 @@ static struct corebth_peripheral_entry *corebth_add_peripheral(struct corebth_co
 
     entry->peripheral = (CBPeripheral *)CFBridgingRetain(peripheral);
     entry->next_service_handle = 1;
+    entry->services_discovered = dispatch_semaphore_create(0);
+    entry->services_discovery_complete = 0;
     snprintf(entry->uuid_string, sizeof(entry->uuid_string), "%s", uuid_str);
 
     char path[128];
@@ -473,6 +488,7 @@ static struct corebth_peripheral_entry *corebth_add_peripheral(struct corebth_co
     entry->name = unix_name_get_or_create(path);
     if (!entry->name)
     {
+        dispatch_release(entry->services_discovered);
         free(entry);
         return NULL;
     }
@@ -481,6 +497,9 @@ static struct corebth_peripheral_entry *corebth_add_peripheral(struct corebth_co
 
     entry->next = ctx->peripherals;
     ctx->peripherals = entry;
+
+    NSLog(@"Wine: corebth_add_peripheral - ADDED entry=%p uuid=%s path=%s handle=%lu",
+          (void*)entry, uuid_str, path, (unsigned long)entry->handle);
 
     return entry;
 }
@@ -573,14 +592,32 @@ static struct corebth_peripheral_entry *corebth_find_peripheral_by_name(struct c
                                                                         struct unix_name *name)
 {
     struct corebth_peripheral_entry *entry;
+    int count = 0;
+    int shown = 0;
 
-    if (!name) return NULL;
+    if (!name || !name->str) {
+        NSLog(@"Wine: corebth_find_peripheral_by_name - name is NULL!");
+        return NULL;
+    }
+
+    NSLog(@"Wine: corebth_find_peripheral_by_name - searching for name=%p str='%s' ctx=%p ctx->peripherals=%p",
+          (void*)name, name->str, (void*)ctx, (void*)ctx->peripherals);
 
     for (entry = ctx->peripherals; entry; entry = entry->next)
     {
-        if (entry->name == name)
+        count++;
+        if (shown < 5) {
+            NSLog(@"Wine: corebth_find_peripheral_by_name - entry[%d]=%p uuid='%s' name->str='%s'",
+                  count, (void*)entry, entry->uuid_string, entry->name ? entry->name->str : "(null)");
+            shown++;
+        }
+        if (entry->name && entry->name->str && strcmp(entry->name->str, name->str) == 0)
+        {
+            NSLog(@"Wine: corebth_find_peripheral_by_name - FOUND at entry %d!", count);
             return entry;
+        }
     }
+    NSLog(@"Wine: corebth_find_peripheral_by_name - NOT FOUND after checking %d entries", count);
     return NULL;
 }
 
@@ -636,7 +673,6 @@ static struct corebth_char_entry *corebth_find_char_by_path(struct corebth_conte
 static void corebth_queue_service_added(struct corebth_context *ctx, struct corebth_service_entry *svc)
 {
     struct corebth_watcher_event event;
-    char uuid_str[64];
     memset(&event, 0, sizeof(event));
     event.event_type = COREBTH_EVENT_GATT_SERVICE_ADDED;
     event.data.gatt_service_added.device.handle = svc->peripheral->handle;
@@ -644,13 +680,6 @@ static void corebth_queue_service_added(struct corebth_context *ctx, struct core
     event.data.gatt_service_added.attr_handle = svc->attr_handle;
     event.data.gatt_service_added.is_primary = svc->is_primary;
     event.data.gatt_service_added.uuid = svc->uuid;
-    snprintf(uuid_str, sizeof(uuid_str), "%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X",
-             svc->uuid.Data1, svc->uuid.Data2, svc->uuid.Data3,
-             svc->uuid.Data4[0], svc->uuid.Data4[1], svc->uuid.Data4[2], svc->uuid.Data4[3],
-             svc->uuid.Data4[4], svc->uuid.Data4[5], svc->uuid.Data4[6], svc->uuid.Data4[7]);
-    NSLog(@"Wine: Queuing GATT_SERVICE_ADDED event - device=%lu service=%lu uuid=%s primary=%d",
-          (unsigned long)svc->peripheral->handle, (unsigned long)(uintptr_t)svc->path,
-          uuid_str, svc->is_primary);
     corebth_queue_event(ctx, &event);
 }
 
@@ -665,9 +694,9 @@ static void corebth_queue_char_added(struct corebth_context *ctx, struct corebth
     corebth_queue_event(ctx, &event);
 }
 
-static struct corebth_service_entry *corebth_add_service(struct corebth_context *ctx,
-                                                         struct corebth_peripheral_entry *periph,
-                                                         CBService *service)
+static struct corebth_service_entry *corebth_create_service_entry(struct corebth_peripheral_entry *periph,
+                                                                   CBService *service,
+                                                                   uint16_t attr_handle)
 {
     struct corebth_service_entry *entry;
     char path[256];
@@ -677,25 +706,38 @@ static struct corebth_service_entry *corebth_add_service(struct corebth_context 
 
     entry->peripheral = periph;
     entry->service = service;
-    entry->attr_handle = periph->next_service_handle++;
+    entry->attr_handle = attr_handle;
     entry->is_primary = service.isPrimary;
+
     corebth_cbuuid_to_guid(service.UUID, &entry->uuid);
     entry->next_char_handle = 1;
 
-    snprintf(path, sizeof(path), "%s/service/%u", periph->name->str, entry->attr_handle);
+    if (!periph->name || !periph->name->str) {
+        free(entry);
+        return NULL;
+    }
+
+    snprintf(path, sizeof(path), "%s/service/%u", periph->name->str, attr_handle);
+
     entry->path = unix_name_get_or_create(path);
+
     if (!entry->path)
     {
         free(entry);
         return NULL;
     }
 
+    return entry;
+}
+
+static void corebth_link_service_entry(struct corebth_context *ctx,
+                                       struct corebth_peripheral_entry *periph,
+                                       struct corebth_service_entry *entry)
+{
     entry->next = periph->services;
     periph->services = entry;
     entry->next_global = ctx->services;
     ctx->services = entry;
-
-    return entry;
 }
 
 static void corebth_fill_props_from_cbcharacteristic(CBCharacteristic *characteristic,
@@ -773,9 +815,33 @@ static void corebth_queue_device_added(struct corebth_context *ctx,
     uuidString = [peripheral.identifier UUIDString];
     uuid_str = [uuidString UTF8String];
 
+    localName = advertisementData[CBAdvertisementDataLocalNameKey];
+
     pthread_mutex_lock(&ctx->peripheral_mutex);
     entry = corebth_find_peripheral(ctx, uuid_str);
     if (entry) {
+        if (localName && entry->has_local_name == 0) {
+            struct corebth_watcher_event props_event;
+            struct corebth_device_props_changed_event *props_changed = &props_event.data.device_props_changed;
+
+            strncpy(entry->friendly_name, [localName UTF8String], BLUETOOTH_MAX_NAME_SIZE - 1);
+            entry->has_local_name = 1;
+            NSLog(@"Wine: Updated device name from scan response: %@", localName);
+
+            memset(&props_event, 0, sizeof(props_event));
+            props_event.event_type = COREBTH_EVENT_DEVICE_PROPS_CHANGED;
+            props_changed->changed_props_mask = WINEBLUETOOTH_DEVICE_PROPERTY_NAME;
+            props_changed->invalid_props_mask = 0;
+            strncpy(props_changed->props.name, entry->friendly_name, BLUETOOTH_MAX_NAME_SIZE - 1);
+            corebth_uuid_to_address(entry->uuid_string, &props_changed->props.address);
+            props_changed->device.handle = entry->handle;
+
+            pthread_mutex_unlock(&ctx->peripheral_mutex);
+            corebth_queue_event(ctx, &props_event);
+            NSLog(@"Wine: Queued DEVICE_PROPS_CHANGED event - name=%s handle=%lu",
+                  props_changed->props.name, (unsigned long)entry->handle);
+            return;
+        }
         pthread_mutex_unlock(&ctx->peripheral_mutex);
         return;
     }
@@ -788,7 +854,7 @@ static void corebth_queue_device_added(struct corebth_context *ctx,
     WinePeripheralDelegate *pdel = [[WinePeripheralDelegate alloc] init];
     pdel.ctx = ctx;
     pdel.periph = entry;
-    entry->peripheral_delegate = pdel;
+    entry->peripheral_delegate = (__bridge_retained void *)pdel;
     peripheral.delegate = pdel;
 
     memset(&event, 0, sizeof(event));
@@ -798,14 +864,26 @@ static void corebth_queue_device_added(struct corebth_context *ctx,
 
     corebth_uuid_to_address(uuid_str, &device_added->props.address);
 
-    localName = advertisementData[CBAdvertisementDataLocalNameKey];
+    NSLog(@"Wine: Device advertisement data - LocalName=%@ peripheral.name=%@ keys=%@",
+          localName, peripheral.name, [advertisementData allKeys]);
+
+    NSData *mfgData = advertisementData[CBAdvertisementDataManufacturerDataKey];
+    if (mfgData) {
+        NSLog(@"Wine: Manufacturer data (%lu bytes): %@", (unsigned long)mfgData.length, mfgData);
+    }
+
     if (localName) {
         name = [localName UTF8String];
+        entry->has_local_name = 1;
     } else if (peripheral.name) {
         name = [peripheral.name UTF8String];
+        entry->has_local_name = 0;
     } else {
         name = "BLE Device";
+        entry->has_local_name = 0;
     }
+
+    strncpy(entry->friendly_name, name, BLUETOOTH_MAX_NAME_SIZE - 1);
     strncpy(device_added->props.name, name, BLUETOOTH_MAX_NAME_SIZE - 1);
 
     device_added->props.connected = (peripheral.state == CBPeripheralStateConnected) ? 1 : 0;
@@ -818,8 +896,9 @@ static void corebth_queue_device_added(struct corebth_context *ctx,
     device_added->radio.handle = ctx->radio_handle;
     device_added->init_entry = 0;
 
-    NSLog(@"Wine: Queuing DEVICE_ADDED event - name=%s uuid=%s handle=%lu",
-          device_added->props.name, uuid_str, (unsigned long)entry->handle);
+    /* Comment out noisy log - device added fires for each discovered device */
+    /* NSLog(@"Wine: Queuing DEVICE_ADDED event - name=%s uuid=%s handle=%lu",
+          device_added->props.name, uuid_str, (unsigned long)entry->handle); */
 
     corebth_queue_event(ctx, &event);
 
@@ -859,7 +938,8 @@ static void corebth_queue_device_added(struct corebth_context *ctx,
      advertisementData:(NSDictionary<NSString *,id> *)advertisementData
                   RSSI:(NSNumber *)RSSI
 {
-    NSLog(@"Wine: discovered peripheral: %@ name: %@", [peripheral.identifier UUIDString], peripheral.name);
+    /* Comment out noisy log - fires for every BLE device in range repeatedly */
+    /* NSLog(@"Wine: discovered peripheral: %@ name: %@", [peripheral.identifier UUIDString], peripheral.name); */
 
     if (self.ctx && self.ctx->discovering) {
         corebth_queue_device_added(self.ctx, peripheral, advertisementData, RSSI);
@@ -868,15 +948,69 @@ static void corebth_queue_device_added(struct corebth_context *ctx,
 
 - (void)centralManager:(CBCentralManager *)central didConnectPeripheral:(CBPeripheral *)peripheral
 {
+    struct corebth_peripheral_entry *entry;
+    struct corebth_watcher_event props_event;
+    struct corebth_device_props_changed_event *props_changed = &props_event.data.device_props_changed;
+
     NSLog(@"Wine: connected to peripheral: %@ name: %@ state: %ld",
           [peripheral.identifier UUIDString], peripheral.name, (long)peripheral.state);
-    NSLog(@"Wine: discovering services for peripheral...");
+
+    if (self.ctx) {
+        pthread_mutex_lock(&self.ctx->peripheral_mutex);
+        entry = corebth_find_peripheral_by_object(self.ctx, peripheral);
+        if (entry) {
+            memset(&props_event, 0, sizeof(props_event));
+            props_event.event_type = COREBTH_EVENT_DEVICE_PROPS_CHANGED;
+            props_changed->changed_props_mask = WINEBLUETOOTH_DEVICE_PROPERTY_CONNECTED;
+            props_changed->invalid_props_mask = 0;
+            props_changed->props.connected = 1;
+            corebth_uuid_to_address(entry->uuid_string, &props_changed->props.address);
+            props_changed->device.handle = entry->handle;
+            pthread_mutex_unlock(&self.ctx->peripheral_mutex);
+
+            corebth_queue_event(self.ctx, &props_event);
+            NSLog(@"Wine: Queued DEVICE_PROPS_CHANGED event - connected=1 handle=%lu",
+                  (unsigned long)entry->handle);
+        } else {
+            pthread_mutex_unlock(&self.ctx->peripheral_mutex);
+            NSLog(@"Wine: connected to unknown peripheral, no event queued");
+        }
+    }
+
+    NSLog(@"Wine: discovering services for peripheral, delegate=%p state=%ld",
+          (void*)peripheral.delegate, (long)peripheral.state);
     [peripheral discoverServices:nil];
+    NSLog(@"Wine: discoverServices:nil called, waiting for callback...");
 }
 
 - (void)centralManager:(CBCentralManager *)central didDisconnectPeripheral:(CBPeripheral *)peripheral error:(NSError *)error
 {
+    struct corebth_peripheral_entry *entry;
+    struct corebth_watcher_event props_event;
+    struct corebth_device_props_changed_event *props_changed = &props_event.data.device_props_changed;
+
     NSLog(@"Wine: disconnected from peripheral: %@", [peripheral.identifier UUIDString]);
+
+    if (self.ctx) {
+        pthread_mutex_lock(&self.ctx->peripheral_mutex);
+        entry = corebth_find_peripheral_by_object(self.ctx, peripheral);
+        if (entry) {
+            memset(&props_event, 0, sizeof(props_event));
+            props_event.event_type = COREBTH_EVENT_DEVICE_PROPS_CHANGED;
+            props_changed->changed_props_mask = WINEBLUETOOTH_DEVICE_PROPERTY_CONNECTED;
+            props_changed->invalid_props_mask = 0;
+            props_changed->props.connected = 0;
+            corebth_uuid_to_address(entry->uuid_string, &props_changed->props.address);
+            props_changed->device.handle = entry->handle;
+            pthread_mutex_unlock(&self.ctx->peripheral_mutex);
+
+            corebth_queue_event(self.ctx, &props_event);
+            NSLog(@"Wine: Queued DEVICE_PROPS_CHANGED event - connected=0 handle=%lu",
+                  (unsigned long)entry->handle);
+        } else {
+            pthread_mutex_unlock(&self.ctx->peripheral_mutex);
+        }
+    }
 }
 
 - (void)centralManager:(CBCentralManager *)central didFailToConnectPeripheral:(CBPeripheral *)peripheral error:(NSError *)error
@@ -892,29 +1026,60 @@ static void corebth_queue_device_added(struct corebth_context *ctx,
 
 - (void)peripheral:(CBPeripheral *)peripheral didDiscoverServices:(NSError *)error
 {
-    NSLog(@"Wine: didDiscoverServices called for %@, error: %@, services count: %lu",
-          [peripheral.identifier UUIDString],
-          error ? [error localizedDescription] : @"(none)",
+    NSLog(@"Wine: didDiscoverServices called! error=%@ ctx=%p periph=%p services.count=%lu",
+          error ? [error localizedDescription] : @"(nil)",
+          (void*)self.ctx, (void*)self.periph,
           (unsigned long)[peripheral.services count]);
-
     if (!self.ctx || !self.periph) {
-        NSLog(@"Wine: didDiscoverServices - ctx or periph is NULL!");
+        NSLog(@"Wine: didDiscoverServices returning early - ctx or periph is NULL");
         return;
     }
 
-    pthread_mutex_lock(&self.ctx->gatt_mutex);
-    for (CBService *service in peripheral.services)
-    {
-        struct corebth_service_entry *svc = corebth_find_service_by_cb(self.ctx, service);
-        if (!svc)
+    NSUInteger count = [peripheral.services count];
+    struct corebth_service_entry **new_entries = NULL;
+    NSUInteger new_count = 0;
+
+    if (count > 0) {
+        new_entries = calloc(count, sizeof(*new_entries));
+        if (!new_entries) goto done;
+
+        uint16_t next_handle = self.periph->next_service_handle;
+        for (CBService *service in peripheral.services)
         {
-            svc = corebth_add_service(self.ctx, self.periph, service);
-            if (svc)
-                corebth_queue_service_added(self.ctx, svc);
+            struct corebth_service_entry *entry = corebth_create_service_entry(self.periph, service, next_handle++);
+            if (entry)
+                new_entries[new_count++] = entry;
         }
-        [peripheral discoverCharacteristics:nil forService:service];
+        self.periph->next_service_handle = next_handle;
     }
+
+    pthread_mutex_lock(&self.ctx->gatt_mutex);
+
+    for (NSUInteger i = 0; i < new_count; i++)
+    {
+        struct corebth_service_entry *entry = new_entries[i];
+        if (!corebth_find_service_by_cb(self.ctx, entry->service))
+        {
+            corebth_link_service_entry(self.ctx, self.periph, entry);
+            corebth_queue_service_added(self.ctx, entry);
+        }
+        else
+        {
+            if (entry->path) unix_name_free(entry->path);
+            free(entry);
+        }
+    }
+
     pthread_mutex_unlock(&self.ctx->gatt_mutex);
+
+    for (CBService *service in peripheral.services)
+        [peripheral discoverCharacteristics:nil forService:service];
+
+done:
+    if (new_entries) free(new_entries);
+
+    self.periph->services_discovery_complete = 1;
+    dispatch_semaphore_signal(self.periph->services_discovered);
 }
 
 - (void)peripheral:(CBPeripheral *)peripheral didDiscoverCharacteristicsForService:(CBService *)service error:(NSError *)error
@@ -1244,33 +1409,87 @@ corebth_status corebth_device_start_pairing( void *connection, void *watcher_ctx
     struct unix_name *device_name = (struct unix_name *)device;
     struct corebth_peripheral_entry *entry;
 
-    if (!ctx || !device_name)
+    fprintf(stderr, "Wine: corebth_device_start_pairing ENTERED: ctx=%p device=%p\n", connection, device);
+    fflush(stderr);
+
+    fprintf(stderr, "Wine: corebth_device_start_pairing - checking params...\n");
+    fflush(stderr);
+
+    if (!ctx)
     {
-        NSLog(@"Wine: corebth_device_start_pairing - invalid params");
+        fprintf(stderr, "Wine: corebth_device_start_pairing - ctx is NULL!\n");
+        fflush(stderr);
         return COREBTH_NOT_SUPPORTED;
     }
 
+    if (!device_name)
+    {
+        fprintf(stderr, "Wine: corebth_device_start_pairing - device_name is NULL!\n");
+        fflush(stderr);
+        return COREBTH_NOT_SUPPORTED;
+    }
+
+    fprintf(stderr, "Wine: corebth_device_start_pairing - params valid, device_name=%p\n", (void*)device_name);
+    fflush(stderr);
+
+    fprintf(stderr, "Wine: corebth_device_start_pairing - about to access device_name->str...\n");
+    fflush(stderr);
+
+    const char *str_val = device_name->str;
+    fprintf(stderr, "Wine: corebth_device_start_pairing - device_name->str=%p '%s'\n", (void*)str_val, str_val ? str_val : "(null)");
+    fflush(stderr);
+
+    fprintf(stderr, "Wine: corebth_device_start_pairing - about to lock peripheral_mutex\n");
+    fflush(stderr);
     pthread_mutex_lock(&ctx->peripheral_mutex);
+    fprintf(stderr, "Wine: corebth_device_start_pairing - locked, calling find_peripheral_by_name\n");
+    fflush(stderr);
     entry = corebth_find_peripheral_by_name(ctx, device_name);
     pthread_mutex_unlock(&ctx->peripheral_mutex);
+    fprintf(stderr, "Wine: corebth_device_start_pairing - unlocked, entry=%p\n", (void*)entry);
+    fflush(stderr);
 
     if (!entry || !entry->peripheral)
     {
-        NSLog(@"Wine: corebth_device_start_pairing - peripheral not found for device");
+        fprintf(stderr, "Wine: corebth_device_start_pairing - peripheral not found for device '%s'\n", device_name->str);
         return COREBTH_NOT_SUPPORTED;
     }
 
-    NSLog(@"Wine: corebth_device_start_pairing - connecting to peripheral: %@ state=%ld",
-          [entry->peripheral.identifier UUIDString], (long)entry->peripheral.state);
+    fprintf(stderr, "Wine: corebth_device_start_pairing - connecting to peripheral: %s state=%ld\n",
+            [[entry->peripheral.identifier UUIDString] UTF8String], (long)entry->peripheral.state);
+    fflush(stderr);
 
-    if (entry->peripheral.state == CBPeripheralStateConnected)
+    if (entry->services_discovery_complete)
     {
-        NSLog(@"Wine: peripheral already connected, discovering services");
-        [entry->peripheral discoverServices:nil];
+        fprintf(stderr, "Wine: services already discovered for peripheral\n");
         return COREBTH_SUCCESS;
     }
 
-    [ctx->central_manager connectPeripheral:entry->peripheral options:nil];
+    entry->services_discovery_complete = 0;
+
+    if (entry->peripheral.state == CBPeripheralStateConnected)
+    {
+        fprintf(stderr, "Wine: peripheral already connected, discovering services\n");
+        fflush(stderr);
+        [entry->peripheral discoverServices:nil];
+    }
+    else
+    {
+        fprintf(stderr, "Wine: connecting to peripheral via connectPeripheral\n");
+        fflush(stderr);
+        [ctx->central_manager connectPeripheral:entry->peripheral options:nil];
+    }
+
+    dispatch_time_t timeout = dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC);
+    fprintf(stderr, "Wine: waiting for service discovery to complete (10s timeout)...\n");
+    fflush(stderr);
+    if (dispatch_semaphore_wait(entry->services_discovered, timeout) != 0)
+    {
+        fprintf(stderr, "Wine: service discovery timed out after 10s\n");
+        return COREBTH_DEVICE_NOT_READY;
+    }
+
+    fprintf(stderr, "Wine: service discovery complete, returning SUCCESS\n");
     return COREBTH_SUCCESS;
 }
 
