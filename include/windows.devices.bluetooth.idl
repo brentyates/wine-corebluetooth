@@ -79,6 +79,7 @@ namespace Windows.Devices.Bluetooth {
 
     namespace GenericAttributeProfile {
         runtimeclass GattDeviceService;
+        runtimeclass GattDeviceServicesResult;
     }
 
     declare {
@@ -93,6 +94,8 @@ namespace Windows.Devices.Bluetooth {
         interface Windows.Foundation.Collections.IVectorView<Windows.Storage.Streams.IBuffer *>;
         interface Windows.Foundation.Collections.IVectorView<Windows.Devices.Bluetooth.Rfcomm.RfcommDeviceService *>;
         interface Windows.Foundation.Collections.IVectorView<Windows.Devices.Bluetooth.GenericAttributeProfile.GattDeviceService *>;
+        interface Windows.Foundation.AsyncOperationCompletedHandler<Windows.Devices.Bluetooth.GenericAttributeProfile.GattDeviceServicesResult *>;
+        interface Windows.Foundation.IAsyncOperation<Windows.Devices.Bluetooth.GenericAttributeProfile.GattDeviceServicesResult *>;
     }
 
     [
@@ -486,12 +489,35 @@ namespace Windows.Devices.Bluetooth {
         HRESULT GetDeviceSelectorFromBluetoothAddressWithBluetoothAddressType([in] UINT64 addr,
                                                                               [in] Windows.Devices.Bluetooth.BluetoothAddressType type,
                                                                               [out, retval] HSTRING *result);
-        /* HRESULT GetDeviceSelectorFromAppearance([in] Windows.Devices.Bluetooth.BluetoothLEAppearance *appearance,
-                                                [out, retval] HSTRING *result); */
+        HRESULT GetDeviceSelectorFromAppearance([in] IInspectable *appearance,
+                                                [out, retval] HSTRING *result);
         [overload("FromBluetoothAddressAsync")]
         HRESULT FromBluetoothAddressWithBluetoothAddressTypeAsync([in] UINT64 addr,
                                                                   [in] Windows.Devices.Bluetooth.BluetoothAddressType type,
                                                                   [out, retval] Windows.Foundation.IAsyncOperation<Windows.Devices.Bluetooth.BluetoothLEDevice *> **async);
+    }
+
+    [
+        contract(Windows.Foundation.UniversalApiContract, 4.0),
+        exclusiveto(Windows.Devices.Bluetooth.BluetoothLEDevice),
+        uuid(aee9e493-44ac-40dc-af33-b2c13c01ca46)
+    ]
+    interface IBluetoothLEDevice3 : IInspectable
+    {
+        [propget] HRESULT DeviceAccessInformation([out, retval] IInspectable **value);
+        HRESULT RequestAccessAsync([out, retval] Windows.Foundation.IAsyncOperation<IInspectable *> **operation);
+        [overload("GetGattServicesAsync")]
+        HRESULT GetGattServicesAsync([out, retval] Windows.Foundation.IAsyncOperation<Windows.Devices.Bluetooth.GenericAttributeProfile.GattDeviceServicesResult *> **operation);
+        [overload("GetGattServicesAsync")]
+        HRESULT GetGattServicesWithCacheModeAsync([in] Windows.Devices.Bluetooth.BluetoothCacheMode cacheMode,
+                                                  [out, retval] Windows.Foundation.IAsyncOperation<Windows.Devices.Bluetooth.GenericAttributeProfile.GattDeviceServicesResult *> **operation);
+        [overload("GetGattServicesForUuidAsync")]
+        HRESULT GetGattServicesForUuidAsync([in] GUID serviceUuid,
+                                            [out, retval] Windows.Foundation.IAsyncOperation<Windows.Devices.Bluetooth.GenericAttributeProfile.GattDeviceServicesResult *> **operation);
+        [overload("GetGattServicesForUuidAsync")]
+        HRESULT GetGattServicesForUuidWithCacheModeAsync([in] GUID serviceUuid,
+                                                         [in] Windows.Devices.Bluetooth.BluetoothCacheMode cacheMode,
+                                                         [out, retval] Windows.Foundation.IAsyncOperation<Windows.Devices.Bluetooth.GenericAttributeProfile.GattDeviceServicesResult *> **operation);
     }
 
     [
@@ -505,7 +531,7 @@ namespace Windows.Devices.Bluetooth {
     {
         [default] interface Windows.Devices.Bluetooth.IBluetoothLEDevice;
         /* [contract(Windows.Foundation.UniversalApiContract, 2.0)] interface Windows.Devices.Bluetooth.IBluetoothLEDevice2; */
-        /* [contract(Windows.Foundation.UniversalApiContract, 4.0)] interface Windows.Devices.Bluetooth.IBluetoothLEDevice3; */
+        [contract(Windows.Foundation.UniversalApiContract, 4.0)] interface Windows.Devices.Bluetooth.IBluetoothLEDevice3;
         /* [contract(Windows.Foundation.UniversalApiContract, 5.0)] interface Windows.Devices.Bluetooth.IBluetoothLEDevice4; */
         /* [contract(Windows.Foundation.UniversalApiContract, 6.0)] interface Windows.Devices.Bluetooth.IBluetoothLEDevice5; */
         /* [contract(Windows.Foundation.UniversalApiContract, 13.0)] interface Windows.Devices.Bluetooth.IBluetoothLEDevice6; */

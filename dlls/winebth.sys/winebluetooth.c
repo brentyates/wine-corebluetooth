@@ -267,6 +267,21 @@ NTSTATUS winebluetooth_gatt_characteristic_set_notify( winebluetooth_gatt_charac
     return UNIX_BLUETOOTH_CALL( bluetooth_gatt_characteristic_set_notify, &args );
 }
 
+NTSTATUS winebluetooth_gatt_characteristic_read_notification( winebluetooth_gatt_characteristic_t characteristic,
+                                                               unsigned char *buffer, unsigned int buffer_size,
+                                                               unsigned int *size )
+{
+    struct bluetooth_gatt_characteristic_read_notification_params args = {0};
+
+    TRACE( "(%p, %p, %u, %p)\n", (void *)characteristic.handle, buffer, buffer_size, size );
+
+    args.characteristic = characteristic.handle;
+    args.buffer = buffer;
+    args.buffer_size = buffer_size;
+    args.size = size;
+    return UNIX_BLUETOOTH_CALL( bluetooth_gatt_characteristic_read_notification, &args );
+}
+
 NTSTATUS winebluetooth_get_event( struct winebluetooth_event *result )
 {
     struct bluetooth_get_event_params params = {0};

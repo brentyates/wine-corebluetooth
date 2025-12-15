@@ -46,6 +46,10 @@
 #define IOCTL_WINEBTH_LE_DEVICE_WRITE_CHARACTERISTIC CTL_CODE(FILE_DEVICE_BLUETOOTH, 0xc3, METHOD_BUFFERED, FILE_ANY_ACCESS)
 /* Enable/disable notifications for a characteristic */
 #define IOCTL_WINEBTH_LE_DEVICE_SET_NOTIFY CTL_CODE(FILE_DEVICE_BLUETOOTH, 0xc4, METHOD_BUFFERED, FILE_ANY_ACCESS)
+/* Get connection status of an LE device (returns BOOL) */
+#define IOCTL_WINEBTH_LE_DEVICE_GET_CONNECTION_STATUS CTL_CODE(FILE_DEVICE_BLUETOOTH, 0xc5, METHOD_BUFFERED, FILE_ANY_ACCESS)
+/* Read pending notifications for a characteristic */
+#define IOCTL_WINEBTH_LE_DEVICE_READ_NOTIFICATION CTL_CODE(FILE_DEVICE_BLUETOOTH, 0xc6, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 DEFINE_GUID( GUID_WINEBTH_AUTHENTICATION_REQUEST, 0xca67235f, 0xf621, 0x4c27, 0x85, 0x65, 0xa4,
              0xd5, 0x5e, 0xa1, 0x26, 0xe8 );
@@ -121,6 +125,14 @@ struct winebth_le_device_set_notify_params
     BTH_LE_GATT_SERVICE service;
     BTH_LE_GATT_CHARACTERISTIC characteristic;
     BOOL enable;
+};
+
+struct winebth_le_device_read_notification_params
+{
+    BTH_LE_GATT_SERVICE service;
+    BTH_LE_GATT_CHARACTERISTIC characteristic;
+    ULONG data_size;
+    UCHAR data[0];
 };
 
 #pragma pack(pop)

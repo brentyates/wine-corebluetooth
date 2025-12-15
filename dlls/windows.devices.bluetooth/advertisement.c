@@ -31,6 +31,7 @@
 #include <winioctl.h>
 #include <ddk/bthguid.h>
 #include <winreg.h>
+#include <winternl.h>
 #undef INITGUID
 
 #include "wine/debug.h"
@@ -38,10 +39,213 @@
 #define IOCTL_WINEBTH_RADIO_START_DISCOVERY CTL_CODE(FILE_DEVICE_BLUETOOTH, 0xa6, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_WINEBTH_RADIO_STOP_DISCOVERY  CTL_CODE(FILE_DEVICE_BLUETOOTH, 0xa7, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
+#define SHADOW_HASH_BUCKETS 256
+#define SHADOW_TTL_MS       30000
+
 WINE_DEFAULT_DEBUG_CHANNEL( bluetooth );
 
 static HRESULT ble_adv_create( IBluetoothLEAdvertisement **adv );
 static HRESULT ble_adv_create_with_name( HSTRING name, IBluetoothLEAdvertisement **adv );
+static HRESULT adv_received_event_args_create( UINT64 address, INT16 rssi, const WCHAR *name,
+                                                IBluetoothLEAdvertisementReceivedEventArgs **out );
+
+struct shadow_entry
+{
+    UINT64 addr;
+    WCHAR name[256];
+    INT16 rssi;
+    boolean connectable;
+    ULONGLONG last_seen;
+    struct shadow_entry *next;
+};
+
+struct shadow_table
+{
+    struct shadow_entry *buckets[SHADOW_HASH_BUCKETS];
+};
+
+struct pending_event
+{
+    UINT64 addr;
+    INT16 rssi;
+    WCHAR name[256];
+    struct pending_event *next;
+};
+
+struct adv_watcher
+{
+    IBluetoothLEAdvertisementWatcher IBluetoothLEAdvertisementWatcher_iface;
+    IBluetoothLEAdvertisementWatcher2 IBluetoothLEAdvertisementWatcher2_iface;
+    LONG ref;
+
+    CRITICAL_SECTION cs;
+    BluetoothLEAdvertisementWatcherStatus status;
+    BluetoothLEScanningMode scanning_mode;
+    boolean allow_extended_advertisements;
+
+    HANDLE radio;
+    HANDLE event_thread;
+    volatile BOOL running;
+
+    ITypedEventHandler_BluetoothLEAdvertisementWatcher_BluetoothLEAdvertisementReceivedEventArgs *received_handler;
+    EventRegistrationToken received_token;
+    LONG next_token;
+
+    ITypedEventHandler_BluetoothLEAdvertisementWatcher_BluetoothLEAdvertisementWatcherStoppedEventArgs *stopped_handler;
+    EventRegistrationToken stopped_token;
+
+    IBluetoothLEAdvertisementFilter *filter;
+
+    struct shadow_table shadow;
+
+    struct pending_event *event_head;
+    struct pending_event *event_tail;
+};
+
+static inline unsigned shadow_hash( UINT64 addr )
+{
+    addr ^= addr >> 33;
+    addr *= 0xff51afd7ed558ccdULL;
+    addr ^= addr >> 33;
+    addr *= 0xc4ceb9fe1a85ec53ULL;
+    addr ^= addr >> 33;
+    return addr & (SHADOW_HASH_BUCKETS - 1);
+}
+
+static struct shadow_entry *shadow_lookup( struct shadow_table *t, UINT64 addr )
+{
+    struct shadow_entry *e = t->buckets[shadow_hash( addr )];
+    while (e)
+    {
+        if (e->addr == addr) return e;
+        e = e->next;
+    }
+    return NULL;
+}
+
+static struct shadow_entry *shadow_get_or_create( struct shadow_table *t, UINT64 addr )
+{
+    unsigned idx = shadow_hash( addr );
+    struct shadow_entry *e = t->buckets[idx];
+    while (e)
+    {
+        if (e->addr == addr) return e;
+        e = e->next;
+    }
+    e = calloc( 1, sizeof(*e) );
+    if (!e) return NULL;
+    e->addr = addr;
+    e->rssi = -50;
+    e->connectable = TRUE;
+    e->last_seen = 0;
+    e->next = t->buckets[idx];
+    t->buckets[idx] = e;
+    return e;
+}
+
+static void shadow_prune( struct shadow_table *t, ULONGLONG now )
+{
+    for (unsigned i = 0; i < SHADOW_HASH_BUCKETS; ++i)
+    {
+        struct shadow_entry **pp = &t->buckets[i];
+        while (*pp)
+        {
+            if (now - (*pp)->last_seen > SHADOW_TTL_MS)
+            {
+                struct shadow_entry *old = *pp;
+                *pp = old->next;
+                free( old );
+                continue;
+            }
+            pp = &(*pp)->next;
+        }
+    }
+}
+
+static void enqueue_pending_event( struct adv_watcher *watcher, UINT64 addr, INT16 rssi, const WCHAR *name )
+{
+    struct pending_event *ev = calloc( 1, sizeof(*ev) );
+    if (!ev) return;
+
+    ev->addr = addr;
+    ev->rssi = rssi;
+    if (name) lstrcpynW( ev->name, name, ARRAY_SIZE( ev->name ) );
+
+    if (watcher->event_tail)
+        watcher->event_tail->next = ev;
+    else
+        watcher->event_head = ev;
+    watcher->event_tail = ev;
+}
+
+static BOOL matches_advertisement_filter( IBluetoothLEAdvertisementFilter *filter, const WCHAR *device_name )
+{
+    IBluetoothLEAdvertisement *adv = NULL;
+    HSTRING filter_name = NULL;
+    const WCHAR *filter_str;
+    UINT32 filter_len;
+    BOOL matches = TRUE;
+
+    if (!filter) return TRUE;
+
+    if (FAILED( IBluetoothLEAdvertisementFilter_get_Advertisement( filter, &adv ) ) || !adv)
+        return TRUE;
+
+    if (FAILED( IBluetoothLEAdvertisement_get_LocalName( adv, &filter_name ) ) || !filter_name)
+    {
+        IBluetoothLEAdvertisement_Release( adv );
+        return TRUE;
+    }
+
+    filter_str = WindowsGetStringRawBuffer( filter_name, &filter_len );
+    if (filter_len > 0)
+    {
+        if (!device_name || !device_name[0])
+            matches = FALSE;
+        else
+            matches = (wcsstr( device_name, filter_str ) != NULL);
+    }
+
+    WindowsDeleteString( filter_name );
+    IBluetoothLEAdvertisement_Release( adv );
+    return matches;
+}
+
+static void process_pending_events( struct adv_watcher *watcher )
+{
+    struct pending_event *ev;
+
+    while ((ev = watcher->event_head))
+    {
+        watcher->event_head = ev->next;
+        if (!watcher->event_head)
+            watcher->event_tail = NULL;
+
+        EnterCriticalSection( &watcher->cs );
+        if (watcher->received_handler && watcher->running)
+        {
+            const WCHAR *name_ptr = ev->name[0] ? ev->name : NULL;
+
+            if (!matches_advertisement_filter( watcher->filter, name_ptr ))
+            {
+                TRACE( "Device '%ls' filtered out\n", name_ptr ? name_ptr : L"(null)" );
+                LeaveCriticalSection( &watcher->cs );
+                free( ev );
+                continue;
+            }
+            IBluetoothLEAdvertisementReceivedEventArgs *args;
+            HRESULT hr = adv_received_event_args_create( ev->addr, ev->rssi, name_ptr, &args );
+            if (SUCCEEDED( hr ))
+            {
+                ITypedEventHandler_BluetoothLEAdvertisementWatcher_BluetoothLEAdvertisementReceivedEventArgs_Invoke(
+                    watcher->received_handler, &watcher->IBluetoothLEAdvertisementWatcher_iface, args );
+                IBluetoothLEAdvertisementReceivedEventArgs_Release( args );
+            }
+        }
+        LeaveCriticalSection( &watcher->cs );
+        free( ev );
+    }
+}
 
 static BOOL get_iface_friendly_name( HDEVINFO devinfo, SP_DEVICE_INTERFACE_DATA *iface_data,
                                      SP_DEVINFO_DATA *devinfo_data, WCHAR *out, DWORD out_len )
@@ -409,6 +613,8 @@ static HRESULT adv_received_event_args_create( UINT64 address, INT16 rssi, const
     impl->IBluetoothLEAdvertisementReceivedEventArgs2_iface.lpVtbl = &adv_received_args2_vtbl;
     impl->ref = 1;
     impl->bluetooth_address = address;
+    TRACE( " DEBUG: Created BluetoothLEAdvertisementReceivedEventArgs with address=0x%I64x (decimal %I64u) ===\n",
+         address, address );
     impl->rssi = rssi;
     impl->adv_type = BluetoothLEAdvertisementType_ConnectableUndirected;
 
@@ -425,31 +631,6 @@ static HRESULT adv_received_event_args_create( UINT64 address, INT16 rssi, const
     *out = &impl->IBluetoothLEAdvertisementReceivedEventArgs_iface;
     return S_OK;
 }
-
-struct adv_watcher
-{
-    IBluetoothLEAdvertisementWatcher IBluetoothLEAdvertisementWatcher_iface;
-    IBluetoothLEAdvertisementWatcher2 IBluetoothLEAdvertisementWatcher2_iface;
-    LONG ref;
-
-    CRITICAL_SECTION cs;
-    BluetoothLEAdvertisementWatcherStatus status;
-    BluetoothLEScanningMode scanning_mode;
-    boolean allow_extended_advertisements;
-
-    HANDLE radio;
-    HANDLE event_thread;
-    volatile BOOL running;
-
-    ITypedEventHandler_BluetoothLEAdvertisementWatcher_BluetoothLEAdvertisementReceivedEventArgs *received_handler;
-    EventRegistrationToken received_token;
-    LONG next_token;
-
-    ITypedEventHandler_BluetoothLEAdvertisementWatcher_BluetoothLEAdvertisementWatcherStoppedEventArgs *stopped_handler;
-    EventRegistrationToken stopped_token;
-
-    IBluetoothLEAdvertisementFilter *filter;
-};
 
 static inline struct adv_watcher *impl_from_IBluetoothLEAdvertisementWatcher( IBluetoothLEAdvertisementWatcher *iface )
 {
@@ -472,69 +653,49 @@ static HANDLE open_first_radio( void )
     HANDLE radio = INVALID_HANDLE_VALUE;
     DWORD idx = 0;
 
-    ERR( "=== open_first_radio CALLED ===\n" );
+    TRACE( " open_first_radio CALLED ===\n" );
 
     devinfo = SetupDiGetClassDevsW( &my_GUID_BTHPORT_DEVICE_INTERFACE, NULL, NULL,
                                     DIGCF_PRESENT | DIGCF_DEVICEINTERFACE );
     if (devinfo == INVALID_HANDLE_VALUE)
     {
-        ERR( "SetupDiGetClassDevsW failed: %lu\n", GetLastError() );
         WARN( "SetupDiGetClassDevsW failed: %lu\n", GetLastError() );
     }
     else
     {
-        ERR( "SetupDiGetClassDevsW succeeded, devinfo=%p\n", devinfo );
-
         iface_detail->cbSize = sizeof( *iface_detail );
         iface_data.cbSize = sizeof( iface_data );
 
         while (SetupDiEnumDeviceInterfaces( devinfo, NULL, &my_GUID_BTHPORT_DEVICE_INTERFACE, idx++, &iface_data ))
         {
-            ERR( "Found device interface idx=%lu\n", idx-1 );
             if (!SetupDiGetDeviceInterfaceDetailW( devinfo, &iface_data, iface_detail, sizeof( buffer ), NULL, NULL ))
-            {
-                ERR( "SetupDiGetDeviceInterfaceDetailW failed: %lu\n", GetLastError() );
                 continue;
-            }
-            ERR( "Device path: %s\n", debugstr_w( iface_detail->DevicePath ) );
             radio = CreateFileW( iface_detail->DevicePath, GENERIC_READ | GENERIC_WRITE,
                                  FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL );
             if (radio != INVALID_HANDLE_VALUE)
             {
-                ERR( "Opened radio device: %s radio=%p\n", debugstr_w( iface_detail->DevicePath ), radio );
                 TRACE( "Opened radio device: %s\n", debugstr_w( iface_detail->DevicePath ) );
                 break;
             }
-            ERR( "CreateFileW failed: %lu\n", GetLastError() );
         }
         SetupDiDestroyDeviceInfoList( devinfo );
     }
 
-    ERR( "=== FALLBACK CHECK: radio=%p INVALID=%p equal=%d ===\n", radio, INVALID_HANDLE_VALUE, radio == INVALID_HANDLE_VALUE );
     if (radio == INVALID_HANDLE_VALUE)
     {
         WCHAR direct_path[64];
         int i;
-        ERR( "=== ENTERING GLOBALROOT FALLBACK ===\n" );
         for (i = 0; i < 4 && radio == INVALID_HANDLE_VALUE; i++)
         {
             swprintf( direct_path, ARRAY_SIZE( direct_path ), L"\\\\?\\GLOBALROOT\\Device\\WINEBTH-RADIO-%d", i );
-            ERR( "Trying direct path: %s\n", debugstr_w( direct_path ) );
             radio = CreateFileW( direct_path, GENERIC_READ | GENERIC_WRITE,
                                  FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL );
             if (radio != INVALID_HANDLE_VALUE)
-            {
-                ERR( "Opened radio via direct path: %s radio=%p\n", debugstr_w( direct_path ), radio );
                 TRACE( "Opened radio via direct path: %s\n", debugstr_w( direct_path ) );
-            }
-            else
-            {
-                ERR( "CreateFileW direct path failed: %lu\n", GetLastError() );
-            }
         }
     }
 
-    ERR( "=== open_first_radio returning radio=%p (enumerated %lu devices) ===\n", radio, idx );
+    TRACE( "open_first_radio returning radio=%p\n", radio );
     return radio;
 }
 
@@ -567,14 +728,17 @@ static void cache_device_name( UINT64 address, const WCHAR *name )
     if (!device_name_cache_cs_initialized)
         init_device_name_cache();
 
+    /* Don't cache placeholder names - we want to re-query until we get the real name */
+    if (!name || !name[0] || !wcscmp( name, L"BLE Device" ))
+        return;
+
     EnterCriticalSection( &device_name_cache_cs );
 
     for (entry = device_name_cache; entry; entry = entry->next)
     {
         if (entry->address == address)
         {
-            if (name && name[0])
-                lstrcpynW( entry->name, name, ARRAY_SIZE( entry->name ) );
+            lstrcpynW( entry->name, name, ARRAY_SIZE( entry->name ) );
             LeaveCriticalSection( &device_name_cache_cs );
             return;
         }
@@ -584,10 +748,7 @@ static void cache_device_name( UINT64 address, const WCHAR *name )
     if (entry)
     {
         entry->address = address;
-        if (name && name[0])
-            lstrcpynW( entry->name, name, ARRAY_SIZE( entry->name ) );
-        else
-            entry->name[0] = 0;
+        lstrcpynW( entry->name, name, ARRAY_SIZE( entry->name ) );
         entry->next = device_name_cache;
         device_name_cache = entry;
     }
@@ -607,18 +768,20 @@ static UINT64 byte_swap_uint64( UINT64 val )
            ((val & 0x00000000000000ffULL) << 56);
 }
 
-static BOOL get_device_name_from_driver( HANDLE radio, UINT64 address, WCHAR *out, DWORD out_len )
+static BOOL get_device_address_from_driver( HANDLE radio, const WCHAR *name, UINT64 *out_addr )
 {
     BTH_DEVICE_INFO_LIST *list;
     DWORD bytes_returned;
-    BTH_ADDR bth_addr;
-    BOOL found = FALSE;
     DWORD i;
     DWORD device_count = 0;
     SIZE_T buffer_size;
     BYTE *buffer = NULL;
+    BOOL found = FALSE;
+    char name_utf8[256];
 
-    ERR( "=== get_device_name_from_driver: address=%I64x ===\n", address );
+    if (!name || !name[0] || !out_addr) return FALSE;
+
+    WideCharToMultiByte( CP_UTF8, 0, name, -1, name_utf8, sizeof(name_utf8), NULL, NULL );
     
     buffer_size = sizeof(BTH_DEVICE_INFO_LIST);
     buffer = malloc( buffer_size );
@@ -629,7 +792,6 @@ static BOOL get_device_name_from_driver( HANDLE radio, UINT64 address, WCHAR *ou
     if (DeviceIoControl( radio, IOCTL_BTH_GET_DEVICE_INFO, NULL, 0, list, buffer_size, &bytes_returned, NULL ))
     {
         device_count = list->numOfDevices;
-        ERR( "=== IOCTL succeeded with minimal buffer, found %lu devices ===\n", device_count );
         if (device_count == 0)
         {
             free( buffer );
@@ -648,10 +810,78 @@ static BOOL get_device_name_from_driver( HANDLE radio, UINT64 address, WCHAR *ou
         list = (BTH_DEVICE_INFO_LIST *)buffer;
         list->numOfDevices = device_count;
         
-        ERR( "=== Retrying IOCTL with exact_size=%lu for %lu devices ===\n", buffer_size, device_count );
         if (!DeviceIoControl( radio, IOCTL_BTH_GET_DEVICE_INFO, NULL, 0, list, buffer_size, &bytes_returned, NULL ))
         {
-            ERR( "=== Retry IOCTL failed: %lu ===\n", GetLastError() );
+            free( buffer );
+            return FALSE;
+        }
+    }
+    else
+    {
+        free( buffer );
+        return FALSE;
+    }
+
+    for (i = 0; i < device_count; i++)
+    {
+        if ((list->deviceList[i].flags & BDIF_NAME) && 
+            !strcmp( list->deviceList[i].name, name_utf8 ))
+        {
+            *out_addr = list->deviceList[i].address;
+            found = TRUE;
+            break;
+        }
+    }
+
+    free( buffer );
+    return found;
+}
+
+static BOOL get_device_name_from_driver( HANDLE radio, UINT64 address, WCHAR *out, DWORD out_len )
+{
+    BTH_DEVICE_INFO_LIST *list;
+    DWORD bytes_returned;
+    BTH_ADDR bth_addr;
+    BOOL found = FALSE;
+    DWORD i;
+    DWORD device_count = 0;
+    SIZE_T buffer_size;
+    BYTE *buffer = NULL;
+
+    TRACE( " get_device_name_from_driver: address=%I64x ===\n", address );
+    
+    buffer_size = sizeof(BTH_DEVICE_INFO_LIST);
+    buffer = malloc( buffer_size );
+    if (!buffer) return FALSE;
+    memset( buffer, 0, buffer_size );
+    list = (BTH_DEVICE_INFO_LIST *)buffer;
+
+    if (DeviceIoControl( radio, IOCTL_BTH_GET_DEVICE_INFO, NULL, 0, list, buffer_size, &bytes_returned, NULL ))
+    {
+        device_count = list->numOfDevices;
+        TRACE( " IOCTL succeeded with minimal buffer, found %lu devices ===\n", device_count );
+        if (device_count == 0)
+        {
+            free( buffer );
+            return FALSE;
+        }
+        
+        free( buffer );
+        if (device_count == 1)
+            buffer_size = sizeof(BTH_DEVICE_INFO_LIST);
+        else
+            buffer_size = sizeof(BTH_DEVICE_INFO_LIST) + sizeof(BTH_DEVICE_INFO) * (device_count - 1);
+        
+        buffer = malloc( buffer_size );
+        if (!buffer) return FALSE;
+        memset( buffer, 0, buffer_size );
+        list = (BTH_DEVICE_INFO_LIST *)buffer;
+        list->numOfDevices = device_count;
+        
+        TRACE( " Retrying IOCTL with exact_size=%lu for %lu devices ===\n", buffer_size, device_count );
+        if (!DeviceIoControl( radio, IOCTL_BTH_GET_DEVICE_INFO, NULL, 0, list, buffer_size, &bytes_returned, NULL ))
+        {
+            TRACE( " Retry IOCTL failed: %lu ===\n", GetLastError() );
             free( buffer );
             return FALSE;
         }
@@ -659,29 +889,29 @@ static BOOL get_device_name_from_driver( HANDLE radio, UINT64 address, WCHAR *ou
     else
     {
         DWORD err = GetLastError();
-        ERR( "=== First IOCTL failed: %lu, numOfDevices=%lu ===\n", err, list->numOfDevices );
+        TRACE( " First IOCTL failed: %lu, numOfDevices=%lu ===\n", err, list->numOfDevices );
         free( buffer );
         return FALSE;
     }
 
     UINT64 search_addr_48 = address & 0xFFFFFFFFFFFFULL;
-    ERR( "=== Searching %lu devices for address %I64x (48-bit=%I64x) ===\n", device_count, address, search_addr_48 );
+    TRACE( " Searching %lu devices for address %I64x (48-bit=%I64x) ===\n", device_count, address, search_addr_48 );
     for (i = 0; i < device_count; i++)
     {
-        ERR( "=== Device %lu: driver_addr=%I64x flags=%lu name='%s' ===\n", i, list->deviceList[i].address, list->deviceList[i].flags, list->deviceList[i].name );
+        TRACE( " Device %lu: driver_addr=%I64x flags=%lu name='%s' ===\n", i, list->deviceList[i].address, list->deviceList[i].flags, list->deviceList[i].name );
         if (list->deviceList[i].address == search_addr_48 && (list->deviceList[i].flags & BDIF_NAME))
         {
             int len = MultiByteToWideChar( CP_UTF8, 0, list->deviceList[i].name, -1, out, out_len );
             if (len > 0)
             {
-                ERR( "=== MATCH! Found device name: %s ===\n", debugstr_w( out ) );
+                TRACE( " MATCH! Found device name: %s ===\n", debugstr_w( out ) );
                 found = TRUE;
                 break;
             }
         }
     }
     if (!found)
-        ERR( "=== No matching device found in driver list ===\n" );
+        TRACE( " No matching device found in driver list ===\n" );
 
     free( buffer );
     return found;
@@ -711,149 +941,141 @@ static BOOL get_cached_device_name( UINT64 address, WCHAR *out, DWORD out_len )
 static DWORD WINAPI adv_watcher_event_thread( void *param )
 {
     struct adv_watcher *watcher = param;
-    BYTE buffer[sizeof( SP_DEVICE_INTERFACE_DETAIL_DATA_W ) + MAX_PATH * sizeof( WCHAR )];
-    SP_DEVICE_INTERFACE_DETAIL_DATA_W *detail = (void *)buffer;
-    SP_DEVICE_INTERFACE_DATA iface_data;
-    SP_DEVINFO_DATA devinfo_data;
-    HDEVINFO devinfo;
-    DWORD idx;
+    BTH_DEVICE_INFO_LIST *list;
+    BYTE *buffer = NULL;
+    SIZE_T buffer_size;
+    DWORD bytes_returned;
+    DWORD i;
 
     init_device_name_cache();
 
-    ERR( "=== Event thread STARTED for watcher %p ===\n", watcher );
-
-    detail->cbSize = sizeof( *detail );
-    iface_data.cbSize = sizeof( iface_data );
-    devinfo_data.cbSize = sizeof( devinfo_data );
+    TRACE( " Event thread STARTED for watcher %p ===\n", watcher );
 
     while (watcher->running)
     {
-        devinfo = SetupDiGetClassDevsW( &GUID_BLUETOOTHLE_DEVICE_INTERFACE, NULL, NULL,
-                                        DIGCF_PRESENT | DIGCF_DEVICEINTERFACE );
-        ERR( "=== SetupDiGetClassDevsW(BTLE) = %p (INVALID=%d) ===\n", devinfo, devinfo == INVALID_HANDLE_VALUE );
-        if (devinfo != INVALID_HANDLE_VALUE)
+        ULONGLONG now = GetTickCount64();
+        DWORD device_count = 0;
+
+        shadow_prune( &watcher->shadow, now );
+
+        /* Query driver directly for all known BLE devices via IOCTL.
+         * This is MUCH faster than waiting for PnP enumeration via SetupDi.
+         * The driver knows about devices as soon as CoreBluetooth discovers them. */
+        if (watcher->radio == INVALID_HANDLE_VALUE)
+            goto sleep_and_continue;
+
+        /* First call to get device count */
+        buffer_size = sizeof(BTH_DEVICE_INFO_LIST);
+        buffer = malloc( buffer_size );
+        if (!buffer) goto sleep_and_continue;
+        memset( buffer, 0, buffer_size );
+        list = (BTH_DEVICE_INFO_LIST *)buffer;
+
+        if (!DeviceIoControl( watcher->radio, IOCTL_BTH_GET_DEVICE_INFO, NULL, 0,
+                              list, buffer_size, &bytes_returned, NULL ))
         {
-            idx = 0;
-            while (SetupDiEnumDeviceInterfaces( devinfo, NULL, &GUID_BLUETOOTHLE_DEVICE_INTERFACE, idx++, &iface_data ) && watcher->running)
-            {
-                UINT64 addr = 0;
-                const WCHAR *path;
-                const WCHAR *addr_ptr;
-                WCHAR device_name[256];
-
-                ERR( "=== Found BTLE device interface idx=%lu ===\n", idx - 1 );
-
-                if (!SetupDiGetDeviceInterfaceDetailW( devinfo, &iface_data, detail, sizeof( buffer ), NULL, &devinfo_data ))
-                    continue;
-
-                path = detail->DevicePath;
-                ERR( "=== BTLE device path: %s ===\n", debugstr_w( path ) );
-
-                addr_ptr = wcsstr( path, L"&" );
-                if (addr_ptr)
-                {
-                    addr_ptr++;
-                    swscanf( addr_ptr, L"%I64x", &addr );
-                    ERR( "=== Parsed address from '&': %I64x ===\n", addr );
-                }
-                else
-                {
-                    addr_ptr = wcsstr( path, L"_" );
-                    if (addr_ptr)
-                    {
-                        addr_ptr++;
-                        swscanf( addr_ptr, L"%I64x", &addr );
-                        ERR( "=== Parsed address from '_': %I64x ===\n", addr );
-                    }
-                    else
-                    {
-                        ERR( "=== No address separator found in path! ===\n" );
-                    }
-                }
-
-                device_name[0] = 0;
-                if (addr)
-                {
-                    ERR( "=== Looking up name for address %I64x, radio=%p (INVALID=%p) ===\n", addr, watcher->radio, INVALID_HANDLE_VALUE );
-                    if (!get_cached_device_name( addr, device_name, ARRAY_SIZE( device_name ) ))
-                    {
-                        ERR( "=== Not in cache, checking driver... ===\n" );
-                        if (watcher->radio != INVALID_HANDLE_VALUE)
-                        {
-                            ERR( "=== Calling get_device_name_from_driver ===\n" );
-                            if (get_device_name_from_driver( watcher->radio, addr, device_name, ARRAY_SIZE( device_name ) ))
-                            {
-                                ERR( "=== Driver returned name: %s ===\n", debugstr_w( device_name ) );
-                                cache_device_name( addr, device_name );
-                            }
-                            else
-                            {
-                                ERR( "=== Driver lookup failed ===\n" );
-                            }
-                        }
-                        else
-                        {
-                            ERR( "=== Radio handle is INVALID, skipping driver lookup ===\n" );
-                        }
-                        if (!device_name[0])
-                        {
-                            ERR( "=== Falling back to SetupAPI lookup ===\n" );
-                            if (!get_iface_friendly_name( devinfo, &iface_data, &devinfo_data, device_name, ARRAY_SIZE( device_name ) ))
-                            {
-                                Sleep( 200 );
-                                if (!get_iface_friendly_name( devinfo, &iface_data, &devinfo_data, device_name, ARRAY_SIZE( device_name ) ))
-                                {
-                                    Sleep( 300 );
-                                    get_iface_friendly_name( devinfo, &iface_data, &devinfo_data, device_name, ARRAY_SIZE( device_name ) );
-                                }
-                            }
-                            if (device_name[0])
-                            {
-                                ERR( "=== SetupAPI returned name: %s ===\n", debugstr_w( device_name ) );
-                                cache_device_name( addr, device_name );
-                            }
-                        }
-                    }
-                    else
-                    {
-                        ERR( "=== Found name in cache: %s ===\n", debugstr_w( device_name ) );
-                    }
-                }
-                if (device_name[0])
-                    ERR( "=== Device FriendlyName: %s ===\n", debugstr_w( device_name ) );
-                else
-                    ERR( "=== Device name is empty, will use empty string ===\n" );
-
-                if (!wcscmp( device_name, L"BLE Device" ))
-                {
-                    ERR( "=== Skipping device with placeholder name 'BLE Device' ===\n" );
-                    continue;
-                }
-
-                if (addr)
-                {
-                    EnterCriticalSection( &watcher->cs );
-                    if (watcher->received_handler && watcher->running)
-                    {
-                        IBluetoothLEAdvertisementReceivedEventArgs *args;
-                        HRESULT hr = adv_received_event_args_create( addr, -50, device_name[0] ? device_name : NULL, &args );
-                        if (SUCCEEDED( hr ))
-                        {
-                            ERR( "=== Invoking Received handler for BLE device %I64x, name=%s ===\n", addr, debugstr_w( device_name ) );
-                            ITypedEventHandler_BluetoothLEAdvertisementWatcher_BluetoothLEAdvertisementReceivedEventArgs_Invoke(
-                                watcher->received_handler, &watcher->IBluetoothLEAdvertisementWatcher_iface, args );
-                            IBluetoothLEAdvertisementReceivedEventArgs_Release( args );
-                        }
-                    }
-                    LeaveCriticalSection( &watcher->cs );
-                }
-            }
-            SetupDiDestroyDeviceInfoList( devinfo );
+            free( buffer );
+            buffer = NULL;
+            goto sleep_and_continue;
         }
 
-        Sleep( 1000 );
+        device_count = list->numOfDevices;
+        if (device_count == 0)
+        {
+            free( buffer );
+            buffer = NULL;
+            goto sleep_and_continue;
+        }
+
+        /* Reallocate for full device list */
+        free( buffer );
+        if (device_count == 1)
+            buffer_size = sizeof(BTH_DEVICE_INFO_LIST);
+        else
+            buffer_size = sizeof(BTH_DEVICE_INFO_LIST) + sizeof(BTH_DEVICE_INFO) * (device_count - 1);
+
+        buffer = malloc( buffer_size );
+        if (!buffer) goto sleep_and_continue;
+        memset( buffer, 0, buffer_size );
+        list = (BTH_DEVICE_INFO_LIST *)buffer;
+        list->numOfDevices = device_count;
+
+        if (!DeviceIoControl( watcher->radio, IOCTL_BTH_GET_DEVICE_INFO, NULL, 0,
+                              list, buffer_size, &bytes_returned, NULL ))
+        {
+            free( buffer );
+            buffer = NULL;
+            goto sleep_and_continue;
+        }
+
+        /* Iterate over ALL devices from the driver - no PnP dependency */
+        for (i = 0; i < device_count && watcher->running; i++)
+        {
+            BTH_DEVICE_INFO *info = &list->deviceList[i];
+            UINT64 addr = info->address;
+            WCHAR device_name[256];
+            struct shadow_entry *entry;
+            BOOL should_notify = FALSE;
+            UINT64 addr_proper;
+
+            if (!addr) continue;
+
+            /* Convert address: driver uses LSB-first, WinRT expects MSB-first */
+            addr_proper = RtlUlonglongByteSwap(addr) >> 16;
+
+            entry = shadow_get_or_create( &watcher->shadow, addr );
+            if (!entry) continue;
+
+            /* Get device name from driver info */
+            device_name[0] = 0;
+            if (info->flags & BDIF_NAME && info->name[0])
+            {
+                MultiByteToWideChar( CP_UTF8, 0, info->name, -1, device_name, ARRAY_SIZE( device_name ) );
+            }
+
+            /* Skip generic "BLE Device" names */
+            if (device_name[0] && !wcscmp( device_name, L"BLE Device" ))
+                device_name[0] = 0;
+
+            /* Check if this is a new device or name changed */
+            if (entry->last_seen == 0)
+            {
+                /* First time seeing this device */
+                if (device_name[0])
+                {
+                    lstrcpynW( entry->name, device_name, ARRAY_SIZE( entry->name ) );
+                    cache_device_name( addr, entry->name );
+                }
+                should_notify = TRUE;
+            }
+            else if (device_name[0] && wcscmp( device_name, entry->name ))
+            {
+                /* Name changed (e.g., scan response arrived with LocalName) */
+                lstrcpynW( entry->name, device_name, ARRAY_SIZE( entry->name ) );
+                cache_device_name( addr, entry->name );
+                should_notify = TRUE;
+            }
+
+            entry->last_seen = now;
+
+            if (should_notify)
+            {
+                TRACE( " IOCTL advertisement: addr=0x%I64x name='%s' ===\n",
+                       addr_proper, debugstr_w( entry->name ) );
+                enqueue_pending_event( watcher, addr_proper, entry->rssi,
+                                       entry->name[0] ? entry->name : NULL );
+            }
+        }
+
+        free( buffer );
+        buffer = NULL;
+
+sleep_and_continue:
+        process_pending_events( watcher );
+        Sleep( 100 );
     }
 
+    if (buffer) free( buffer );
     TRACE( "Event thread exiting for watcher %p\n", watcher );
     return 0;
 }
@@ -917,6 +1139,12 @@ static ULONG WINAPI adv_watcher_Release( IBluetoothLEAdvertisementWatcher *iface
                 impl->stopped_handler );
         if (impl->filter)
             IBluetoothLEAdvertisementFilter_Release( impl->filter );
+        while (impl->event_head)
+        {
+            struct pending_event *next = impl->event_head->next;
+            free( impl->event_head );
+            impl->event_head = next;
+        }
         DeleteCriticalSection( &impl->cs );
         free( impl );
     }
@@ -1012,6 +1240,7 @@ static HRESULT WINAPI adv_watcher_put_ScanningMode( IBluetoothLEAdvertisementWat
                                                      BluetoothLEScanningMode value )
 {
     struct adv_watcher *impl = impl_from_IBluetoothLEAdvertisementWatcher( iface );
+    TRACE( " put_ScanningMode CALLED === iface=%p value=%d\n", iface, value );
     TRACE( "(%p, %d)\n", iface, value );
     EnterCriticalSection( &impl->cs );
     impl->scanning_mode = value;
@@ -1022,6 +1251,7 @@ static HRESULT WINAPI adv_watcher_put_ScanningMode( IBluetoothLEAdvertisementWat
 static HRESULT WINAPI adv_watcher_get_SignalStrengthFilter( IBluetoothLEAdvertisementWatcher *iface,
                                                             IBluetoothSignalStrengthFilter **filter )
 {
+    TRACE( " get_SignalStrengthFilter CALLED === iface=%p filter=%p\n", iface, filter );
     TRACE( "(%p, %p)\n", iface, filter );
     if (!filter) return E_POINTER;
     *filter = NULL;
@@ -1073,7 +1303,7 @@ static HRESULT WINAPI adv_watcher_Start( IBluetoothLEAdvertisementWatcher *iface
     struct adv_watcher *impl = impl_from_IBluetoothLEAdvertisementWatcher( iface );
     DWORD bytes;
 
-    ERR( "=== adv_watcher_Start CALLED === iface=%p impl=%p\n", iface, impl );
+    TRACE( " adv_watcher_Start CALLED === iface=%p impl=%p\n", iface, impl );
     TRACE( "(%p)\n", iface );
 
     EnterCriticalSection( &impl->cs );
@@ -1479,9 +1709,9 @@ static HRESULT WINAPI adv_watcher_factory_GetTrustLevel( IActivationFactory *ifa
 static HRESULT WINAPI adv_watcher_factory_ActivateInstance( IActivationFactory *iface, IInspectable **instance )
 {
     HRESULT hr;
-    ERR( "=== adv_watcher_factory_ActivateInstance CALLED === iface=%p instance=%p\n", iface, instance );
+    TRACE( " adv_watcher_factory_ActivateInstance CALLED === iface=%p instance=%p\n", iface, instance );
     hr = adv_watcher_create( (IBluetoothLEAdvertisementWatcher **)instance );
-    ERR( "=== adv_watcher_factory_ActivateInstance result: hr=0x%08lx instance=%p ===\n", hr, *instance );
+    TRACE( " adv_watcher_factory_ActivateInstance result: hr=0x%08lx instance=%p ===\n", hr, *instance );
     return hr;
 }
 
@@ -1510,6 +1740,7 @@ struct adv_filter
 {
     IBluetoothLEAdvertisementFilter IBluetoothLEAdvertisementFilter_iface;
     LONG ref;
+    IBluetoothLEAdvertisement *advertisement;
 };
 
 static inline struct adv_filter *impl_from_IBluetoothLEAdvertisementFilter( IBluetoothLEAdvertisementFilter *iface )
@@ -1550,7 +1781,11 @@ static ULONG WINAPI adv_filter_Release( IBluetoothLEAdvertisementFilter *iface )
     struct adv_filter *impl = impl_from_IBluetoothLEAdvertisementFilter( iface );
     ULONG ref = InterlockedDecrement( &impl->ref );
     TRACE( "(%p) -> %lu\n", iface, ref );
-    if (!ref) free( impl );
+    if (!ref)
+    {
+        if (impl->advertisement) IBluetoothLEAdvertisement_Release( impl->advertisement );
+        free( impl );
+    }
     return ref;
 }
 
@@ -1590,16 +1825,23 @@ static HRESULT WINAPI adv_filter_GetTrustLevel( IBluetoothLEAdvertisementFilter 
 static HRESULT WINAPI adv_filter_get_Advertisement( IBluetoothLEAdvertisementFilter *iface,
                                                      IBluetoothLEAdvertisement **value )
 {
+    struct adv_filter *impl = impl_from_IBluetoothLEAdvertisementFilter( iface );
     TRACE( "(%p, %p)\n", iface, value );
     if (!value) return E_POINTER;
-    *value = NULL;
+    *value = impl->advertisement;
+    if (*value) IBluetoothLEAdvertisement_AddRef( *value );
     return S_OK;
 }
 
 static HRESULT WINAPI adv_filter_put_Advertisement( IBluetoothLEAdvertisementFilter *iface,
                                                      IBluetoothLEAdvertisement *value )
 {
-    TRACE( "(%p, %p): stub!\n", iface, value );
+    struct adv_filter *impl = impl_from_IBluetoothLEAdvertisementFilter( iface );
+    TRACE( "(%p, %p)\n", iface, value );
+
+    if (impl->advertisement) IBluetoothLEAdvertisement_Release( impl->advertisement );
+    impl->advertisement = value;
+    if (value) IBluetoothLEAdvertisement_AddRef( value );
     return S_OK;
 }
 

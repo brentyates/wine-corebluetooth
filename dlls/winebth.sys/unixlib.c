@@ -391,7 +391,27 @@ static NTSTATUS bluetooth_gatt_characteristic_set_notify( void *args )
     if (!dbus_connection) return STATUS_NOT_SUPPORTED;
 #ifdef __APPLE__
     return corebth_characteristic_set_notify( dbus_connection, params->characteristic->str,
-                                              params->enable );
+                                             params->enable );
+#else
+    return STATUS_NOT_IMPLEMENTED;
+#endif
+}
+
+static NTSTATUS bluetooth_gatt_characteristic_read_notification( void *args )
+{
+    struct bluetooth_gatt_characteristic_read_notification_params *params = args;
+
+    if (!dbus_connection) return STATUS_NOT_SUPPORTED;
+#ifdef __APPLE__
+    {
+        corebth_status ret;
+        ret = corebth_characteristic_read_notification( dbus_connection, params->characteristic->str,
+                                                        params->buffer, params->buffer_size, params->size );
+        if (ret == COREBTH_SUCCESS) return STATUS_SUCCESS;
+        if (ret == COREBTH_TIMEOUT) return STATUS_TIMEOUT;
+        if (ret == COREBTH_NOT_SUPPORTED) return STATUS_NOT_SUPPORTED;
+        return STATUS_INTERNAL_ERROR;
+    }
 #else
     return STATUS_NOT_IMPLEMENTED;
 #endif
@@ -436,6 +456,7 @@ const unixlib_entry_t __wine_unix_call_funcs[] = {
     bluetooth_gatt_characteristic_read,
     bluetooth_gatt_characteristic_write,
     bluetooth_gatt_characteristic_set_notify,
+    bluetooth_gatt_characteristic_read_notification,
 
     bluetooth_get_event,
 };

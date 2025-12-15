@@ -264,6 +264,9 @@ NTSTATUS winebluetooth_gatt_characteristic_write( winebluetooth_gatt_characteris
                                                    int write_type );
 NTSTATUS winebluetooth_gatt_characteristic_set_notify( winebluetooth_gatt_characteristic_t characteristic,
                                                         int enable );
+NTSTATUS winebluetooth_gatt_characteristic_read_notification( winebluetooth_gatt_characteristic_t characteristic,
+                                                               unsigned char *buffer, unsigned int buffer_size,
+                                                               unsigned int *size );
 static inline BOOL winebluetooth_gatt_characteristic_equal( winebluetooth_gatt_characteristic_t c1,
                                                             winebluetooth_gatt_characteristic_t c2)
 {

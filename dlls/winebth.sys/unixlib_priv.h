@@ -68,6 +68,9 @@ extern void bluez_watcher_close( void *connection, void *ctx );
 
 #ifdef __APPLE__
 typedef int corebth_status;
+#define COREBTH_SUCCESS            0
+#define COREBTH_NOT_SUPPORTED      ((corebth_status)0xC00000BB)
+#define COREBTH_TIMEOUT            ((corebth_status)0x00000102)
 extern void *corebth_init( void );
 extern void corebth_close( void *connection );
 extern void corebth_free( void *connection );
@@ -97,6 +100,9 @@ extern corebth_status corebth_characteristic_write( void *connection, const char
                                                     int write_type );
 extern corebth_status corebth_characteristic_set_notify( void *connection, const char *char_path,
                                                          int enable );
+extern corebth_status corebth_characteristic_read_notification( void *connection, const char *char_path,
+                                                                unsigned char *buffer, unsigned int buffer_size,
+                                                                unsigned int *size );
 #endif /* __APPLE__ */
 
 #endif /* __WINE_WINEBTH_UNIXLIB_PRIV_H */
