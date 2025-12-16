@@ -287,14 +287,14 @@ struct corebth_peripheral_entry
     char uuid_string[64];
     char friendly_name[BLUETOOTH_MAX_NAME_SIZE];
     int has_local_name;
-    int device_added;  // Whether DEVICE_ADDED event has been sent to driver
+    int device_added;  /* Whether DEVICE_ADDED event has been sent to driver */
     struct corebth_service_entry *services;
     uint16_t next_service_handle;
     void *peripheral_delegate;
     dispatch_semaphore_t services_discovered;
     int services_discovery_complete;
-    int pending_char_discovery_count;  // Number of services awaiting char discovery
-    int char_discovery_started;  // Guard against duplicate didDiscoverServices callbacks
+    int pending_char_discovery_count;  /* Number of services awaiting char discovery */
+    int char_discovery_started;  /* Guard against duplicate didDiscoverServices callbacks */
 };
 
 struct corebth_char_entry;
@@ -763,8 +763,6 @@ static void corebth_queue_service_added(struct corebth_context *ctx, struct core
 static void corebth_queue_char_added(struct corebth_context *ctx, struct corebth_char_entry *ch)
 {
     struct corebth_watcher_event event;
-    fprintf(stderr, "Wine: corebth_queue_char_added: char_handle=%p svc_handle=%p uuid=%08x\n",
-            (void*)ch->path, (void*)ch->service->path, ch->props.CharacteristicUuid.Value.ShortUuid);
     memset(&event, 0, sizeof(event));
     event.event_type = COREBTH_EVENT_GATT_CHAR_ADDED;
     event.data.gatt_char_added.characteristic.handle = (uintptr_t)ch->path;
@@ -981,12 +979,12 @@ static void corebth_queue_device_added(struct corebth_context *ctx,
     entry = corebth_find_peripheral(ctx, uuid_str);
     if (entry) {
         if (localName && entry->has_local_name == 0) {
-            // Got LocalName for existing device - update name
+            /* Got LocalName for existing device - update name */
             strncpy(entry->friendly_name, [localName UTF8String], BLUETOOTH_MAX_NAME_SIZE - 1);
             entry->has_local_name = 1;
 
             if (entry->device_added) {
-                // Device already added to driver - send property change
+                /* Device already added to driver - send property change */
                 struct corebth_watcher_event props_event;
                 struct corebth_device_props_changed_event *props_changed = &props_event.data.device_props_changed;
 
