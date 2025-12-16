@@ -1,8 +1,8 @@
 MODULE  = winebth.sys
 IMPORTS = ntoskrnl uuid
 UNIXLIB = winebth.so
-UNIX_CFLAGS = $(DBUS_CFLAGS) $(COREBLUETOOTH_CFLAGS)
-UNIX_LIBS = $(PTHREAD_LIBS) $(COREBLUETOOTH_LIBS)
+UNIX_CFLAGS = $(DBUS_CFLAGS) -x objective-c
+UNIX_LIBS = $(PTHREAD_LIBS) -framework CoreBluetooth -framework Foundation -framework IOBluetooth -lobjc
 
 EXTRADLLFLAGS = -Wl,--subsystem,native
 

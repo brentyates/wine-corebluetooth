@@ -180,6 +180,7 @@ HRESULT WINAPI BluetoothGATTGetCharacteristicValue( HANDLE device, PBTH_LE_GATT_
     if (!params)
         return HRESULT_FROM_WIN32( ERROR_NO_SYSTEM_RESOURCES );
 
+    memset( &params->service, 0, sizeof(params->service) );
     params->characteristic = *characteristic;
     if (!DeviceIoControl( device, IOCTL_WINEBTH_LE_DEVICE_READ_CHARACTERISTIC, params, size, params, size, &bytes, NULL ))
     {
@@ -234,6 +235,7 @@ HRESULT WINAPI BluetoothGATTSetCharacteristicValue( HANDLE device, PBTH_LE_GATT_
     if (!params)
         return HRESULT_FROM_WIN32( ERROR_NO_SYSTEM_RESOURCES );
 
+    memset( &params->service, 0, sizeof(params->service) );
     params->characteristic = *characteristic;
     params->write_type = write_type;
     params->data_size = value->DataSize;

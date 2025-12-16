@@ -2425,7 +2425,8 @@ static DWORD WINAPI gatt_char_notification_thread( void *arg )
     BTH_LE_GATT_SERVICE service_info;
     BTH_LE_GATT_CHARACTERISTIC char_info;
 
-    TRACE( " gatt_char_notification_thread: STARTED for char_handle=%u ===\n", impl->char_info.AttributeHandle );
+    CoInitializeEx( NULL, COINIT_MULTITHREADED );
+    TRACE( " gatt_char_notification_thread: STARTED for char_handle=%u (COM initialized) ===\n", impl->char_info.AttributeHandle );
     
 
     impl->IGattCharacteristic_iface.lpVtbl->AddRef( &impl->IGattCharacteristic_iface );
@@ -2566,6 +2567,7 @@ static DWORD WINAPI gatt_char_notification_thread( void *arg )
     free( params );
     TRACE( " gatt_char_notification_thread: EXITING ===\n" );
     impl->IGattCharacteristic_iface.lpVtbl->Release( &impl->IGattCharacteristic_iface );
+    CoUninitialize();
     return 0;
 }
 
@@ -4271,7 +4273,7 @@ static HRESULT WINAPI gatt_service3_GetCharacteristicsWithCacheModeAsync( IGattD
     
 
     status = GattCommunicationStatus_Unreachable;
-    for (retry = 0; retry < 30; retry++)
+    for (retry = 0; retry < 10; retry++)
     {
         memset( params, 0, buffer_size );
         params->service = impl->service_info;
@@ -4303,16 +4305,16 @@ static HRESULT WINAPI gatt_service3_GetCharacteristicsWithCacheModeAsync( IGattD
             else
             {
                 TRACE( " IOCTL returned success but count=0 (retry %d) ===\n", retry );
-                
+
             }
-            Sleep( 100 );
+            Sleep( 50 );
         }
         else
         {
             DWORD err = GetLastError();
             TRACE( " IOCTL failed (retry %d): error=%lu ===\n", retry, err );
-            
-            Sleep( 100 );
+
+            Sleep( 50 );
         }
     }
 
@@ -5312,9 +5314,10 @@ static DWORD WINAPI gatt_services_thread( void *arg )
     SIZE_T buffer_size;
     HRESULT hr;
     int retries = 0;
-    const int max_retries = 30;
+    const int max_retries = 10;
 
-    FIXME( "=== gatt_services_thread: STARTED device=%p handle=%p ===\n", impl, impl->device_handle );
+    CoInitializeEx( NULL, COINIT_MULTITHREADED );
+    FIXME( "=== gatt_services_thread: STARTED device=%p handle=%p (COM initialized) ===\n", impl, impl->device_handle );
 
     if (impl->device_handle == INVALID_HANDLE_VALUE)
     {
@@ -5340,7 +5343,7 @@ retry:
         if (ctx->mode == BluetoothCacheMode_Uncached && params->count == 0 && retries < max_retries)
         {
              TRACE( "Uncached mode and 0 services, waiting... (retry %d/%d)\n", retries+1, max_retries );
-             Sleep( 100 );
+             Sleep( 50 );
              retries++;
              goto retry;
         }
@@ -5445,6 +5448,7 @@ done:
     IBluetoothLEDevice3_Release( ctx->iface );
     IAsyncOperation_GattDeviceServicesResult_Release( ctx->op );
     free( ctx );
+    CoUninitialize();
     return 0;
 }
 
@@ -5611,7 +5615,7 @@ static HANDLE open_le_device_interface( UINT64 address )
 
     TRACE( " open_le_device_interface: searching for address %I64x (48-bit: %I64x, str: %s, swapped: %s) ===\n", address, addr_48, debugstr_w( addr_str ), debugstr_w( addr_str_swapped ) );
 
-    for (retry = 0; retry < 30; retry++)
+    for (retry = 0; retry < 10; retry++)
     {
         idx = 0;
         devinfo = SetupDiGetClassDevsW( &btle_device_interface_guid, NULL, NULL,
@@ -5666,7 +5670,7 @@ static HANDLE open_le_device_interface( UINT64 address )
         SetupDiDestroyDeviceInfoList( devinfo );
 
         if (retry == 0)
-            TRACE( " Device interface not found, waiting for PnP enumeration (max 6s)... ===\n" );
+            TRACE( " Device interface not found, waiting for PnP enumeration (max 2s)... ===\n" );
         Sleep( 200 );
     }
 

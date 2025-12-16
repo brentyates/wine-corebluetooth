@@ -401,6 +401,12 @@ static NTSTATUS bluetooth_remote_device_dispatch( DEVICE_OBJECT *device, struct 
             break;
         }
 
+        if (insize < offsetof( struct winebth_le_device_write_characteristic_params, data ) + params->data_size)
+        {
+            status = STATUS_INVALID_USER_BUFFER;
+            break;
+        }
+
         EnterCriticalSection( &ext->props_cs );
         le_to_uuid( &params->service.ServiceUuid, &svc_uuid );
         if (IsEqualGUID( &svc_uuid, &GUID_NULL ))
