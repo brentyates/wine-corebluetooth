@@ -131,8 +131,11 @@ static ULONG WINAPI gatt_buffer_Release( IBuffer *iface )
 
 static HRESULT WINAPI gatt_buffer_GetIids( IBuffer *iface, ULONG *iid_count, IID **iids )
 {
-    FIXME( "(%p, %p, %p): stub!\n", iface, iid_count, iids );
-    return E_NOTIMPL;
+    TRACE( "(%p, %p, %p)\n", iface, iid_count, iids );
+    if (!iid_count || !iids) return E_POINTER;
+    *iid_count = 0;
+    *iids = NULL;
+    return S_OK;
 }
 
 static HRESULT WINAPI gatt_buffer_GetRuntimeClassName( IBuffer *iface, HSTRING *class_name )
@@ -1872,14 +1875,19 @@ static ULONG WINAPI gatt_service_Release( IGattDeviceService *iface )
 
 static HRESULT WINAPI gatt_service_GetIids( IGattDeviceService *iface, ULONG *iid_count, IID **iids )
 {
-    FIXME( "(%p, %p, %p): stub!\n", iface, iid_count, iids );
-    return E_NOTIMPL;
+    TRACE( "(%p, %p, %p)\n", iface, iid_count, iids );
+    if (!iid_count || !iids) return E_POINTER;
+    *iid_count = 0;
+    *iids = NULL;
+    return S_OK;
 }
 
 static HRESULT WINAPI gatt_service_GetRuntimeClassName( IGattDeviceService *iface, HSTRING *class_name )
 {
-    FIXME( "(%p, %p): stub!\n", iface, class_name );
-    return E_NOTIMPL;
+    TRACE( "(%p, %p)\n", iface, class_name );
+    return WindowsCreateString( L"Windows.Devices.Bluetooth.GenericAttributeProfile.GattDeviceService",
+                                 wcslen( L"Windows.Devices.Bluetooth.GenericAttributeProfile.GattDeviceService" ),
+                                 class_name );
 }
 
 static HRESULT WINAPI gatt_service_GetTrustLevel( IGattDeviceService *iface, TrustLevel *level )
@@ -5317,11 +5325,11 @@ static DWORD WINAPI gatt_services_thread( void *arg )
     const int max_retries = 10;
 
     CoInitializeEx( NULL, COINIT_MULTITHREADED );
-    FIXME( "=== gatt_services_thread: STARTED device=%p handle=%p (COM initialized) ===\n", impl, impl->device_handle );
+    TRACE( "gatt_services_thread: started device=%p handle=%p\n", impl, impl->device_handle );
 
     if (impl->device_handle == INVALID_HANDLE_VALUE)
     {
-        FIXME( "=== gatt_services_thread: Device handle INVALID! ===\n" );
+        ERR( "gatt_services_thread: device handle invalid\n" );
         goto done;
     }
 
@@ -5333,11 +5341,11 @@ retry:
     memset( params, 0, buffer_size );
     params->count = 0;
 
-    FIXME( "=== gatt_services_thread: calling IOCTL... ===\n" );
+    TRACE( "gatt_services_thread: calling IOCTL\n" );
     if (DeviceIoControl( impl->device_handle, IOCTL_WINEBTH_LE_DEVICE_GET_GATT_SERVICES, NULL, 0,
                          params, buffer_size, &bytes_returned, NULL ))
     {
-        FIXME( "=== gatt_services_thread: IOCTL OK count=%lu mode=%d retry=%d filter=%d ===\n", params->count, ctx->mode, retries, ctx->has_filter_uuid );
+        TRACE( "gatt_services_thread: IOCTL OK count=%lu mode=%d retry=%d filter=%d\n", params->count, ctx->mode, retries, ctx->has_filter_uuid );
         status = GattCommunicationStatus_Success;
 
         if (ctx->mode == BluetoothCacheMode_Uncached && params->count == 0 && retries < max_retries)
@@ -5355,7 +5363,7 @@ retry:
                 BTH_LE_GATT_SERVICE filtered_services[16];
                 ULONG filtered_count = 0;
                 ULONG i;
-                FIXME( "=== gatt_services_thread: filtering for UUID %s ===\n", debugstr_guid( &ctx->filter_uuid ) );
+                TRACE( "gatt_services_thread: filtering for UUID %s\n", debugstr_guid( &ctx->filter_uuid ) );
                 for (i = 0; i < params->count && filtered_count < 16; i++)
                 {
                     GUID svc_guid;
@@ -5370,14 +5378,14 @@ retry:
                     {
                         svc_guid = params->services[i].ServiceUuid.Value.LongUuid;
                     }
-                    FIXME( "=== gatt_services_thread: service[%lu] UUID=%s ===\n", i, debugstr_guid( &svc_guid ) );
+                    TRACE( "gatt_services_thread: service[%lu] UUID=%s\n", i, debugstr_guid( &svc_guid ) );
                     if (IsEqualGUID( &svc_guid, &ctx->filter_uuid ))
                     {
-                        FIXME( "=== gatt_services_thread: matched service at index %lu ===\n", i );
+                        TRACE( "gatt_services_thread: matched service at index %lu\n", i );
                         filtered_services[filtered_count++] = params->services[i];
                     }
                 }
-                FIXME( "=== gatt_services_thread: filtered %lu -> %lu services ===\n", params->count, filtered_count );
+                TRACE( "gatt_services_thread: filtered %lu -> %lu services\n", params->count, filtered_count );
                 if (filtered_count > 0)
                 {
                     hr = gatt_services_vector_create( filtered_services, filtered_count, impl->device_handle,
@@ -5408,7 +5416,7 @@ retry:
     }
 
 done:
-    FIXME( "=== gatt_services_thread: done, gatt_status=%d ===\n", status );
+    TRACE( "gatt_services_thread: done, gatt_status=%d\n", status );
     if (params) free( params );
 
     hr = gatt_services_result_create( status, services_vector, &result );
@@ -5418,33 +5426,23 @@ done:
     {
         op_impl->result = result;
         op_impl->status = Completed;
-        FIXME( "=== gatt_services_thread: async_status=Completed ===\n" );
+        TRACE( "gatt_services_thread: async_status=Completed\n" );
     }
     else
     {
         op_impl->status = Error;
-        FIXME( "=== gatt_services_thread: async_status=Error hr=0x%lx ===\n", hr );
+        ERR( "gatt_services_thread: async_status=Error hr=0x%lx\n", hr );
     }
 
-    FIXME( "=== gatt_services_thread: handler=%p result=%p status=%d ===\n", op_impl->handler, op_impl->result, op_impl->status );
+    TRACE( "gatt_services_thread: handler=%p result=%p status=%d\n", op_impl->handler, op_impl->result, op_impl->status );
     if (op_impl->handler)
     {
         HRESULT invoke_hr;
-        void **handler_vtbl = *(void***)op_impl->handler;
-        void *handler_invoke = handler_vtbl ? handler_vtbl[3] : NULL; /* Invoke is at vtable[3] after QI,AddRef,Release */
-        UINT64 *handler_data = (UINT64*)op_impl->handler;
-        FIXME( "=== gatt_services_thread: handler vtable=%p invoke_func=%p handler[1]=%p (event ptr?) ===\n",
-               handler_vtbl, handler_invoke, (void*)handler_data[1] );
-        FIXME( "=== gatt_services_thread: invoking handler ctx->op=%p op_impl->status=%d tick=%lu ===\n", ctx->op, op_impl->status, GetTickCount() );
         invoke_hr = IAsyncOperationCompletedHandler_GattDeviceServicesResult_Invoke( op_impl->handler, ctx->op, op_impl->status );
-        FIXME( "=== gatt_services_thread: handler returned hr=0x%lx tick=%lu ===\n", invoke_hr, GetTickCount() );
-    }
-    else
-    {
-        FIXME( "=== gatt_services_thread: handler is NULL ===\n" );
+        TRACE( "gatt_services_thread: handler returned hr=0x%lx\n", invoke_hr );
     }
 
-    FIXME( "=== gatt_services_thread: DONE final_status=%d ===\n", op_impl->status );
+    TRACE( "gatt_services_thread: done final_status=%d\n", op_impl->status );
     IBluetoothLEDevice3_Release( ctx->iface );
     IAsyncOperation_GattDeviceServicesResult_Release( ctx->op );
     free( ctx );
