@@ -327,17 +327,16 @@ static NTSTATUS bluetooth_device_start_pairing( void *args )
     struct bluetooth_device_start_pairing_params *params = args;
     NTSTATUS status;
 
-    fprintf(stderr, "Wine: bluetooth_device_start_pairing called, dbus_connection=%p device=%p irp=%p\n",
-            dbus_connection, (void *)params->device, params->irp);
+    TRACE( "dbus_connection=%p device=%p irp=%p\n", dbus_connection, (void *)params->device, params->irp );
 
     if (!dbus_connection)
     {
-        fprintf(stderr, "Wine: bluetooth_device_start_pairing: dbus_connection is NULL!\n");
+        TRACE( "dbus_connection is NULL\n" );
         return STATUS_NOT_SUPPORTED;
     }
 #ifdef __APPLE__
     status = corebth_device_start_pairing( dbus_connection, bluetooth_watcher, params->device, params->irp );
-    fprintf(stderr, "Wine: corebth_device_start_pairing returned 0x%lx\n", (unsigned long)status);
+    TRACE( "corebth_device_start_pairing returned %#lx\n", (unsigned long)status );
     return status;
 #else
     return bluez_device_start_pairing( dbus_connection, bluetooth_watcher, params->device, params->irp );
