@@ -947,9 +947,10 @@ static DWORD WINAPI adv_watcher_event_thread( void *param )
     DWORD bytes_returned;
     DWORD i;
 
+    CoInitializeEx( NULL, COINIT_MULTITHREADED );
     init_device_name_cache();
 
-    TRACE( " Event thread STARTED for watcher %p ===\n", watcher );
+    TRACE( " Event thread STARTED for watcher %p (COM initialized) ===\n", watcher );
 
     while (watcher->running)
     {
@@ -1077,6 +1078,7 @@ sleep_and_continue:
 
     if (buffer) free( buffer );
     TRACE( "Event thread exiting for watcher %p\n", watcher );
+    CoUninitialize();
     return 0;
 }
 
