@@ -19,6 +19,8 @@
 
 #include "private.h"
 
+#include <assert.h>
+
 #define INITGUID
 #include <setupapi.h>
 #include <devguid.h>
@@ -47,6 +49,50 @@ DEFINE_GUID(IID___x_ABI_CWindows_CStorage_CStreams_CIBufferByteAccess, 0x905a0fe
 #include "wine/list.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL( bluetooth );
+
+static const GUID my_GUID_BTHPORT_DEVICE_INTERFACE = { 0x850302a, 0xb344, 0x4fda, { 0x9b, 0xe9, 0x90, 0x57, 0x6b, 0x8d, 0x46, 0xf0 } };
+
+static HANDLE open_first_radio( void )
+{
+    char buffer[sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W) + MAX_PATH * sizeof( WCHAR )];
+    SP_DEVICE_INTERFACE_DETAIL_DATA_W *iface_detail = (SP_DEVICE_INTERFACE_DETAIL_DATA_W *)buffer;
+    SP_DEVICE_INTERFACE_DATA iface_data;
+    HDEVINFO devinfo;
+    HANDLE radio = INVALID_HANDLE_VALUE;
+    DWORD idx = 0;
+
+    devinfo = SetupDiGetClassDevsW( &my_GUID_BTHPORT_DEVICE_INTERFACE, NULL, NULL,
+                                    DIGCF_PRESENT | DIGCF_DEVICEINTERFACE );
+    if (devinfo != INVALID_HANDLE_VALUE)
+    {
+        iface_detail->cbSize = sizeof( *iface_detail );
+        iface_data.cbSize = sizeof( iface_data );
+
+        while (SetupDiEnumDeviceInterfaces( devinfo, NULL, &my_GUID_BTHPORT_DEVICE_INTERFACE, idx++, &iface_data ))
+        {
+            if (!SetupDiGetDeviceInterfaceDetailW( devinfo, &iface_data, iface_detail, sizeof( buffer ), NULL, NULL ))
+                continue;
+            radio = CreateFileW( iface_detail->DevicePath, GENERIC_READ | GENERIC_WRITE,
+                                 FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL );
+            if (radio != INVALID_HANDLE_VALUE)
+                break;
+        }
+        SetupDiDestroyDeviceInfoList( devinfo );
+    }
+
+    if (radio == INVALID_HANDLE_VALUE)
+    {
+        WCHAR direct_path[64];
+        int i;
+        for (i = 0; i < 4 && radio == INVALID_HANDLE_VALUE; i++)
+        {
+            swprintf( direct_path, ARRAY_SIZE( direct_path ), L"\\\\?\\GLOBALROOT\\Device\\WINEBTH-RADIO-%d", i );
+            radio = CreateFileW( direct_path, GENERIC_READ | GENERIC_WRITE,
+                                 FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL );
+        }
+    }
+    return radio;
+}
 
 struct handler_entry
 {
@@ -330,7 +376,7 @@ static HRESULT WINAPI factory_ActivateInstance( IActivationFactory *iface, IInsp
     TRACE( "(%p, %p)\n", iface, instance );
     if (!instance) return E_POINTER;
     *instance = NULL;
-    return E_NOTIMPL;
+    ERR("!!! E_NOTIMPL - CRASHING!\n"); abort(); return E_NOTIMPL;
 }
 
 static const struct IActivationFactoryVtbl factory_vtbl =
@@ -350,6 +396,7 @@ DEFINE_IINSPECTABLE( bluetoothdevice_statics, IBluetoothDeviceStatics, struct bl
 
 static HRESULT bluetooth_device_create( HSTRING id, UINT64 address, IBluetoothDevice **out );
 static HRESULT async_bt_device_op_create( IBluetoothDevice *device, IAsyncOperation_BluetoothDevice **out );
+static HRESULT gatt_services_vector_create( BTH_LE_GATT_SERVICE *services, ULONG count, HANDLE device_handle, const WCHAR *device_id, UINT64 device_address, IVectorView_GattDeviceService **out );
 
 static BOOL get_device_name_from_id( const WCHAR *device_id, UINT64 address, WCHAR *name, DWORD name_len )
 {
@@ -458,7 +505,7 @@ static HRESULT WINAPI bluetoothdevice_statics_FromHostNameAsync( IBluetoothDevic
     TRACE( "(%p, %p, %p)\n", iface, name, async_op );
     if (!async_op) return E_POINTER;
     *async_op = NULL;
-    return E_NOTIMPL;
+    ERR("!!! E_NOTIMPL - CRASHING!\n"); abort(); return E_NOTIMPL;
 }
 
 static HRESULT WINAPI bluetoothdevice_statics_FromBluetoothAddressAsync( IBluetoothDeviceStatics *iface,
@@ -606,7 +653,7 @@ static HRESULT WINAPI ble_device_factory_ActivateInstance( IActivationFactory *i
     TRACE( "(%p, %p)\n", iface, instance );
     if (!instance) return E_POINTER;
     *instance = NULL;
-    return E_NOTIMPL;
+    ERR("!!! E_NOTIMPL - CRASHING!\n"); abort(); return E_NOTIMPL;
 }
 
 static const struct IActivationFactoryVtbl ble_device_factory_vtbl =
@@ -1428,9 +1475,15 @@ static HRESULT WINAPI le_device_get_GattServices( IBluetoothLEDevice *iface, IVe
     {
         if (params->count > 0)
         {
-            FIXME( "Found %lu GATT services, but IVectorView_GattDeviceService not implemented\n", params->count );
+            ERR( "Found %lu GATT services, creating vector for synchronous property\n", params->count );
+            hr = gatt_services_vector_create( params->services, params->count,
+                                               impl->device_handle, WindowsGetStringRawBuffer( impl->id, NULL ),
+                                               impl->address, value );
         }
-        *value = NULL;
+        else
+        {
+            *value = NULL;
+        }
     }
     else
     {
@@ -1456,6 +1509,23 @@ static HRESULT WINAPI le_device_get_ConnectionStatus( IBluetoothLEDevice *iface,
 
     if (impl->device_handle == INVALID_HANDLE_VALUE)
     {
+        HANDLE radio_handle = open_first_radio();
+        if (radio_handle != INVALID_HANDLE_VALUE)
+        {
+            struct winebth_radio_get_device_connection_status_params params;
+            params.address = impl->address;
+            params.connected = FALSE;
+
+            if (DeviceIoControl( radio_handle, IOCTL_WINEBTH_RADIO_GET_DEVICE_CONNECTION_STATUS,
+                                 &params, sizeof(params), &params, sizeof(params), &bytes_returned, NULL ))
+            {
+                *value = params.connected ? BluetoothConnectionStatus_Connected : BluetoothConnectionStatus_Disconnected;
+                TRACE( "ConnectionStatus from radio: connected=%d\n", params.connected );
+                CloseHandle( radio_handle );
+                return S_OK;
+            }
+            CloseHandle( radio_handle );
+        }
         *value = BluetoothConnectionStatus_Disconnected;
         return S_OK;
     }
@@ -1464,12 +1534,13 @@ static HRESULT WINAPI le_device_get_ConnectionStatus( IBluetoothLEDevice *iface,
                          NULL, 0, &connected, sizeof(connected), &bytes_returned, NULL ))
     {
         *value = connected ? BluetoothConnectionStatus_Connected : BluetoothConnectionStatus_Disconnected;
-        TRACE( "ConnectionStatus from driver: connected=%d\n", connected );
+        ERR( "ConnectionStatus from driver: connected=%d status=%d (0=Disconnected,1=Connected)\n", connected, *value );
     }
     else
     {
         WARN( "IOCTL_WINEBTH_LE_DEVICE_GET_CONNECTION_STATUS failed: error=%lu\n", GetLastError() );
         *value = BluetoothConnectionStatus_Disconnected;
+        ERR( "ConnectionStatus IOCTL FAILED, returning Disconnected\n" );
     }
 
     return S_OK;
@@ -1816,6 +1887,7 @@ struct gatt_device_service
     HANDLE device_handle;
     BTH_LE_GATT_SERVICE service_info;
     WCHAR *device_id;
+    UINT64 device_address;
 };
 
 static inline struct gatt_device_service *impl_from_IGattDeviceService( IGattDeviceService *iface )
@@ -1904,7 +1976,7 @@ static HRESULT WINAPI gatt_service_GetCharacteristics( IGattDeviceService *iface
     FIXME( "(%p, %s, %p): stub!\n", iface, debugstr_guid( &uuid ), value );
     if (!value) return E_POINTER;
     *value = NULL;
-    return E_NOTIMPL;
+    ERR("!!! E_NOTIMPL - CRASHING!\n"); abort(); return E_NOTIMPL;
 }
 
 static HRESULT WINAPI gatt_service_GetIncludedServices( IGattDeviceService *iface, GUID uuid,
@@ -1913,7 +1985,7 @@ static HRESULT WINAPI gatt_service_GetIncludedServices( IGattDeviceService *ifac
     FIXME( "(%p, %s, %p): stub!\n", iface, debugstr_guid( &uuid ), value );
     if (!value) return E_POINTER;
     *value = NULL;
-    return E_NOTIMPL;
+    ERR("!!! E_NOTIMPL - CRASHING!\n"); abort(); return E_NOTIMPL;
 }
 
 static HRESULT WINAPI gatt_service_get_DeviceId( IGattDeviceService *iface, HSTRING *value )
@@ -2083,7 +2155,7 @@ static ULONG WINAPI gatt_char_Release( IGattCharacteristic *iface )
 static HRESULT WINAPI gatt_char_GetIids( IGattCharacteristic *iface, ULONG *iid_count, IID **iids )
 {
     FIXME( "(%p, %p, %p): stub!\n", iface, iid_count, iids );
-    return E_NOTIMPL;
+    ERR("!!! E_NOTIMPL - CRASHING!\n"); abort(); return E_NOTIMPL;
 }
 
 static HRESULT WINAPI gatt_char_GetRuntimeClassName( IGattCharacteristic *iface, HSTRING *class_name )
@@ -2107,7 +2179,7 @@ static HRESULT WINAPI gatt_char_GetDescriptors( IGattCharacteristic *iface, GUID
     FIXME( "(%p, %s, %p): stub!\n", iface, debugstr_guid( &uuid ), value );
     if (!value) return E_POINTER;
     *value = NULL;
-    return E_NOTIMPL;
+    ERR("!!! E_NOTIMPL - CRASHING!\n"); abort(); return E_NOTIMPL;
 }
 
 static HRESULT WINAPI gatt_char_get_CharacteristicProperties( IGattCharacteristic *iface, GattCharacteristicProperties *value )
@@ -2168,7 +2240,7 @@ static HRESULT WINAPI gatt_char_get_PresentationFormats( IGattCharacteristic *if
     FIXME( "(%p, %p): stub!\n", iface, value );
     if (!value) return E_POINTER;
     *value = NULL;
-    return E_NOTIMPL;
+    ERR("!!! E_NOTIMPL - CRASHING!\n"); abort(); return E_NOTIMPL;
 }
 
 static HRESULT gatt_char_read_value_impl( IGattCharacteristic *iface, IAsyncOperation_GattReadResult **value )
@@ -2371,7 +2443,7 @@ static HRESULT WINAPI gatt_char_ReadClientCharacteristicConfigurationDescriptorA
                                                                                         IAsyncOperation_GattReadClientCharacteristicConfigurationDescriptorResult **async )
 {
     FIXME( "(%p, %p): stub!\n", iface, async );
-    return E_NOTIMPL;
+    ERR("!!! E_NOTIMPL - CRASHING!\n"); abort(); return E_NOTIMPL;
 }
 
 static HRESULT WINAPI gatt_char_WriteClientCharacteristicConfigurationDescriptorAsync( IGattCharacteristic *iface,
@@ -2749,13 +2821,13 @@ static ULONG WINAPI gatt_chars_iterator_Release( IIterator_GattCharacteristic *i
 static HRESULT WINAPI gatt_chars_iterator_GetIids( IIterator_GattCharacteristic *iface, ULONG *iid_count, IID **iids )
 {
     FIXME( "(%p, %p, %p): stub!\n", iface, iid_count, iids );
-    return E_NOTIMPL;
+    ERR("!!! E_NOTIMPL - CRASHING!\n"); abort(); return E_NOTIMPL;
 }
 
 static HRESULT WINAPI gatt_chars_iterator_GetRuntimeClassName( IIterator_GattCharacteristic *iface, HSTRING *class_name )
 {
     FIXME( "(%p, %p): stub!\n", iface, class_name );
-    return E_NOTIMPL;
+    ERR("!!! E_NOTIMPL - CRASHING!\n"); abort(); return E_NOTIMPL;
 }
 
 static HRESULT WINAPI gatt_chars_iterator_GetTrustLevel( IIterator_GattCharacteristic *iface, TrustLevel *level )
@@ -2862,13 +2934,13 @@ static ULONG WINAPI gatt_chars_iterable_Release( IIterable_GattCharacteristic *i
 static HRESULT WINAPI gatt_chars_iterable_GetIids( IIterable_GattCharacteristic *iface, ULONG *iid_count, IID **iids )
 {
     FIXME( "(%p, %p, %p): stub!\n", iface, iid_count, iids );
-    return E_NOTIMPL;
+    ERR("!!! E_NOTIMPL - CRASHING!\n"); abort(); return E_NOTIMPL;
 }
 
 static HRESULT WINAPI gatt_chars_iterable_GetRuntimeClassName( IIterable_GattCharacteristic *iface, HSTRING *class_name )
 {
     FIXME( "(%p, %p): stub!\n", iface, class_name );
-    return E_NOTIMPL;
+    ERR("!!! E_NOTIMPL - CRASHING!\n"); abort(); return E_NOTIMPL;
 }
 
 static HRESULT WINAPI gatt_chars_iterable_GetTrustLevel( IIterable_GattCharacteristic *iface, TrustLevel *level )
@@ -2959,13 +3031,13 @@ static ULONG WINAPI gatt_chars_vector_Release( IVectorView_GattCharacteristic *i
 static HRESULT WINAPI gatt_chars_vector_GetIids( IVectorView_GattCharacteristic *iface, ULONG *iid_count, IID **iids )
 {
     FIXME( "(%p, %p, %p): stub!\n", iface, iid_count, iids );
-    return E_NOTIMPL;
+    ERR("!!! E_NOTIMPL - CRASHING!\n"); abort(); return E_NOTIMPL;
 }
 
 static HRESULT WINAPI gatt_chars_vector_GetRuntimeClassName( IVectorView_GattCharacteristic *iface, HSTRING *class_name )
 {
     FIXME( "(%p, %p): stub!\n", iface, class_name );
-    return E_NOTIMPL;
+    ERR("!!! E_NOTIMPL - CRASHING!\n"); abort(); return E_NOTIMPL;
 }
 
 static HRESULT WINAPI gatt_chars_vector_GetTrustLevel( IVectorView_GattCharacteristic *iface, TrustLevel *level )
@@ -3006,7 +3078,7 @@ static HRESULT WINAPI gatt_chars_vector_IndexOf( IVectorView_GattCharacteristic 
                                                   UINT32 *index, BOOLEAN *found )
 {
     FIXME( "(%p, %p, %p, %p): stub!\n", iface, element, index, found );
-    return E_NOTIMPL;
+    ERR("!!! E_NOTIMPL - CRASHING!\n"); abort(); return E_NOTIMPL;
 }
 
 static HRESULT WINAPI gatt_chars_vector_GetMany( IVectorView_GattCharacteristic *iface, UINT32 start_index,
@@ -3149,7 +3221,7 @@ static ULONG WINAPI gatt_chars_result_Release( IGattCharacteristicsResult *iface
 static HRESULT WINAPI gatt_chars_result_GetIids( IGattCharacteristicsResult *iface, ULONG *iid_count, IID **iids )
 {
     FIXME( "(%p, %p, %p): stub!\n", iface, iid_count, iids );
-    return E_NOTIMPL;
+    ERR("!!! E_NOTIMPL - CRASHING!\n"); abort(); return E_NOTIMPL;
 }
 
 static HRESULT WINAPI gatt_chars_result_GetRuntimeClassName( IGattCharacteristicsResult *iface, HSTRING *class_name )
@@ -3290,13 +3362,13 @@ static ULONG WINAPI async_gatt_chars_op_Release( IAsyncOperation_GattCharacteris
 static HRESULT WINAPI async_gatt_chars_op_GetIids( IAsyncOperation_GattCharacteristicsResult *iface, ULONG *iid_count, IID **iids )
 {
     FIXME( "(%p, %p, %p): stub!\n", iface, iid_count, iids );
-    return E_NOTIMPL;
+    ERR("!!! E_NOTIMPL - CRASHING!\n"); abort(); return E_NOTIMPL;
 }
 
 static HRESULT WINAPI async_gatt_chars_op_GetRuntimeClassName( IAsyncOperation_GattCharacteristicsResult *iface, HSTRING *class_name )
 {
     FIXME( "(%p, %p): stub!\n", iface, class_name );
-    return E_NOTIMPL;
+    ERR("!!! E_NOTIMPL - CRASHING!\n"); abort(); return E_NOTIMPL;
 }
 
 static HRESULT WINAPI async_gatt_chars_op_GetTrustLevel( IAsyncOperation_GattCharacteristicsResult *iface, TrustLevel *level )
@@ -3380,25 +3452,25 @@ static ULONG WINAPI async_gatt_chars_info_Release( IAsyncInfo *iface )
 static HRESULT WINAPI async_gatt_chars_info_GetIids( IAsyncInfo *iface, ULONG *iid_count, IID **iids )
 {
     FIXME( "(%p, %p, %p): stub!\n", iface, iid_count, iids );
-    return E_NOTIMPL;
+    ERR("!!! E_NOTIMPL - CRASHING!\n"); abort(); return E_NOTIMPL;
 }
 
 static HRESULT WINAPI async_gatt_chars_info_GetRuntimeClassName( IAsyncInfo *iface, HSTRING *class_name )
 {
     FIXME( "(%p, %p): stub!\n", iface, class_name );
-    return E_NOTIMPL;
+    ERR("!!! E_NOTIMPL - CRASHING!\n"); abort(); return E_NOTIMPL;
 }
 
 static HRESULT WINAPI async_gatt_chars_info_GetTrustLevel( IAsyncInfo *iface, TrustLevel *level )
 {
     FIXME( "(%p, %p): stub!\n", iface, level );
-    return E_NOTIMPL;
+    ERR("!!! E_NOTIMPL - CRASHING!\n"); abort(); return E_NOTIMPL;
 }
 
 static HRESULT WINAPI async_gatt_chars_info_get_Id( IAsyncInfo *iface, UINT32 *id )
 {
     FIXME( "(%p, %p): stub!\n", iface, id );
-    return E_NOTIMPL;
+    ERR("!!! E_NOTIMPL - CRASHING!\n"); abort(); return E_NOTIMPL;
 }
 
 static HRESULT WINAPI async_gatt_chars_info_get_Status( IAsyncInfo *iface, AsyncStatus *status )
@@ -3413,13 +3485,13 @@ static HRESULT WINAPI async_gatt_chars_info_get_Status( IAsyncInfo *iface, Async
 static HRESULT WINAPI async_gatt_chars_info_get_ErrorCode( IAsyncInfo *iface, HRESULT *error_code )
 {
     FIXME( "(%p, %p): stub!\n", iface, error_code );
-    return E_NOTIMPL;
+    ERR("!!! E_NOTIMPL - CRASHING!\n"); abort(); return E_NOTIMPL;
 }
 
 static HRESULT WINAPI async_gatt_chars_info_Cancel( IAsyncInfo *iface )
 {
     FIXME( "(%p): stub!\n", iface );
-    return E_NOTIMPL;
+    ERR("!!! E_NOTIMPL - CRASHING!\n"); abort(); return E_NOTIMPL;
 }
 
 static HRESULT WINAPI async_gatt_chars_info_Close( IAsyncInfo *iface )
@@ -3511,7 +3583,7 @@ static ULONG WINAPI gatt_read_result_Release( IGattReadResult *iface )
 static HRESULT WINAPI gatt_read_result_GetIids( IGattReadResult *iface, ULONG *iid_count, IID **iids )
 {
     FIXME( "(%p, %p, %p): stub!\n", iface, iid_count, iids );
-    return E_NOTIMPL;
+    ERR("!!! E_NOTIMPL - CRASHING!\n"); abort(); return E_NOTIMPL;
 }
 
 static HRESULT WINAPI gatt_read_result_GetRuntimeClassName( IGattReadResult *iface, HSTRING *class_name )
@@ -3633,7 +3705,7 @@ static ULONG WINAPI gatt_value_changed_args_Release( IGattValueChangedEventArgs 
 static HRESULT WINAPI gatt_value_changed_args_GetIids( IGattValueChangedEventArgs *iface, ULONG *iid_count, IID **iids )
 {
     FIXME( "(%p, %p, %p): stub!\n", iface, iid_count, iids );
-    return E_NOTIMPL;
+    ERR("!!! E_NOTIMPL - CRASHING!\n"); abort(); return E_NOTIMPL;
 }
 
 static HRESULT WINAPI gatt_value_changed_args_GetRuntimeClassName( IGattValueChangedEventArgs *iface, HSTRING *class_name )
@@ -3769,13 +3841,13 @@ static ULONG WINAPI async_gatt_read_op_Release( IAsyncOperation_GattReadResult *
 static HRESULT WINAPI async_gatt_read_op_GetIids( IAsyncOperation_GattReadResult *iface, ULONG *iid_count, IID **iids )
 {
     FIXME( "(%p, %p, %p): stub!\n", iface, iid_count, iids );
-    return E_NOTIMPL;
+    ERR("!!! E_NOTIMPL - CRASHING!\n"); abort(); return E_NOTIMPL;
 }
 
 static HRESULT WINAPI async_gatt_read_op_GetRuntimeClassName( IAsyncOperation_GattReadResult *iface, HSTRING *class_name )
 {
     FIXME( "(%p, %p): stub!\n", iface, class_name );
-    return E_NOTIMPL;
+    ERR("!!! E_NOTIMPL - CRASHING!\n"); abort(); return E_NOTIMPL;
 }
 
 static HRESULT WINAPI async_gatt_read_op_GetTrustLevel( IAsyncOperation_GattReadResult *iface, TrustLevel *level )
@@ -3859,25 +3931,25 @@ static ULONG WINAPI async_gatt_read_info_Release( IAsyncInfo *iface )
 static HRESULT WINAPI async_gatt_read_info_GetIids( IAsyncInfo *iface, ULONG *iid_count, IID **iids )
 {
     FIXME( "(%p, %p, %p): stub!\n", iface, iid_count, iids );
-    return E_NOTIMPL;
+    ERR("!!! E_NOTIMPL - CRASHING!\n"); abort(); return E_NOTIMPL;
 }
 
 static HRESULT WINAPI async_gatt_read_info_GetRuntimeClassName( IAsyncInfo *iface, HSTRING *class_name )
 {
     FIXME( "(%p, %p): stub!\n", iface, class_name );
-    return E_NOTIMPL;
+    ERR("!!! E_NOTIMPL - CRASHING!\n"); abort(); return E_NOTIMPL;
 }
 
 static HRESULT WINAPI async_gatt_read_info_GetTrustLevel( IAsyncInfo *iface, TrustLevel *level )
 {
     FIXME( "(%p, %p): stub!\n", iface, level );
-    return E_NOTIMPL;
+    ERR("!!! E_NOTIMPL - CRASHING!\n"); abort(); return E_NOTIMPL;
 }
 
 static HRESULT WINAPI async_gatt_read_info_get_Id( IAsyncInfo *iface, UINT32 *id )
 {
     FIXME( "(%p, %p): stub!\n", iface, id );
-    return E_NOTIMPL;
+    ERR("!!! E_NOTIMPL - CRASHING!\n"); abort(); return E_NOTIMPL;
 }
 
 static HRESULT WINAPI async_gatt_read_info_get_Status( IAsyncInfo *iface, AsyncStatus *status )
@@ -3892,13 +3964,13 @@ static HRESULT WINAPI async_gatt_read_info_get_Status( IAsyncInfo *iface, AsyncS
 static HRESULT WINAPI async_gatt_read_info_get_ErrorCode( IAsyncInfo *iface, HRESULT *error_code )
 {
     FIXME( "(%p, %p): stub!\n", iface, error_code );
-    return E_NOTIMPL;
+    ERR("!!! E_NOTIMPL - CRASHING!\n"); abort(); return E_NOTIMPL;
 }
 
 static HRESULT WINAPI async_gatt_read_info_Cancel( IAsyncInfo *iface )
 {
     FIXME( "(%p): stub!\n", iface );
-    return E_NOTIMPL;
+    ERR("!!! E_NOTIMPL - CRASHING!\n"); abort(); return E_NOTIMPL;
 }
 
 static HRESULT WINAPI async_gatt_read_info_Close( IAsyncInfo *iface )
@@ -3998,13 +4070,13 @@ static ULONG WINAPI async_gatt_comm_status_op_Release( IAsyncOperation_GattCommu
 static HRESULT WINAPI async_gatt_comm_status_op_GetIids( IAsyncOperation_GattCommunicationStatus *iface, ULONG *iid_count, IID **iids )
 {
     FIXME( "(%p, %p, %p): stub!\n", iface, iid_count, iids );
-    return E_NOTIMPL;
+    ERR("!!! E_NOTIMPL - CRASHING!\n"); abort(); return E_NOTIMPL;
 }
 
 static HRESULT WINAPI async_gatt_comm_status_op_GetRuntimeClassName( IAsyncOperation_GattCommunicationStatus *iface, HSTRING *class_name )
 {
     FIXME( "(%p, %p): stub!\n", iface, class_name );
-    return E_NOTIMPL;
+    ERR("!!! E_NOTIMPL - CRASHING!\n"); abort(); return E_NOTIMPL;
 }
 
 static HRESULT WINAPI async_gatt_comm_status_op_GetTrustLevel( IAsyncOperation_GattCommunicationStatus *iface, TrustLevel *level )
@@ -4087,25 +4159,25 @@ static ULONG WINAPI async_gatt_comm_status_info_Release( IAsyncInfo *iface )
 static HRESULT WINAPI async_gatt_comm_status_info_GetIids( IAsyncInfo *iface, ULONG *iid_count, IID **iids )
 {
     FIXME( "(%p, %p, %p): stub!\n", iface, iid_count, iids );
-    return E_NOTIMPL;
+    ERR("!!! E_NOTIMPL - CRASHING!\n"); abort(); return E_NOTIMPL;
 }
 
 static HRESULT WINAPI async_gatt_comm_status_info_GetRuntimeClassName( IAsyncInfo *iface, HSTRING *class_name )
 {
     FIXME( "(%p, %p): stub!\n", iface, class_name );
-    return E_NOTIMPL;
+    ERR("!!! E_NOTIMPL - CRASHING!\n"); abort(); return E_NOTIMPL;
 }
 
 static HRESULT WINAPI async_gatt_comm_status_info_GetTrustLevel( IAsyncInfo *iface, TrustLevel *level )
 {
     FIXME( "(%p, %p): stub!\n", iface, level );
-    return E_NOTIMPL;
+    ERR("!!! E_NOTIMPL - CRASHING!\n"); abort(); return E_NOTIMPL;
 }
 
 static HRESULT WINAPI async_gatt_comm_status_info_get_Id( IAsyncInfo *iface, UINT32 *id )
 {
     FIXME( "(%p, %p): stub!\n", iface, id );
-    return E_NOTIMPL;
+    ERR("!!! E_NOTIMPL - CRASHING!\n"); abort(); return E_NOTIMPL;
 }
 
 static HRESULT WINAPI async_gatt_comm_status_info_get_Status( IAsyncInfo *iface, AsyncStatus *status )
@@ -4120,13 +4192,13 @@ static HRESULT WINAPI async_gatt_comm_status_info_get_Status( IAsyncInfo *iface,
 static HRESULT WINAPI async_gatt_comm_status_info_get_ErrorCode( IAsyncInfo *iface, HRESULT *error_code )
 {
     FIXME( "(%p, %p): stub!\n", iface, error_code );
-    return E_NOTIMPL;
+    ERR("!!! E_NOTIMPL - CRASHING!\n"); abort(); return E_NOTIMPL;
 }
 
 static HRESULT WINAPI async_gatt_comm_status_info_Cancel( IAsyncInfo *iface )
 {
     FIXME( "(%p): stub!\n", iface );
-    return E_NOTIMPL;
+    ERR("!!! E_NOTIMPL - CRASHING!\n"); abort(); return E_NOTIMPL;
 }
 
 static HRESULT WINAPI async_gatt_comm_status_info_Close( IAsyncInfo *iface )
@@ -4210,7 +4282,7 @@ static HRESULT WINAPI gatt_service3_get_DeviceAccessInformation( IGattDeviceServ
     FIXME( "(%p, %p): stub!\n", iface, value );
     if (!value) return E_POINTER;
     *value = NULL;
-    return E_NOTIMPL;
+    ERR("!!! E_NOTIMPL - CRASHING!\n"); abort(); return E_NOTIMPL;
 }
 
 static HRESULT WINAPI gatt_service3_get_Session( IGattDeviceService3 *iface, IGattSession **value )
@@ -4218,7 +4290,7 @@ static HRESULT WINAPI gatt_service3_get_Session( IGattDeviceService3 *iface, IGa
     FIXME( "(%p, %p): stub!\n", iface, value );
     if (!value) return E_POINTER;
     *value = NULL;
-    return E_NOTIMPL;
+    ERR("!!! E_NOTIMPL - CRASHING!\n"); abort(); return E_NOTIMPL;
 }
 
 static HRESULT WINAPI gatt_service3_get_SharingMode( IGattDeviceService3 *iface, GattSharingMode *value )
@@ -4233,14 +4305,14 @@ static HRESULT WINAPI gatt_service3_RequestAccessAsync( IGattDeviceService3 *ifa
                                                          IAsyncOperation_DeviceAccessStatus **async )
 {
     FIXME( "(%p, %p): stub!\n", iface, async );
-    return E_NOTIMPL;
+    ERR("!!! E_NOTIMPL - CRASHING!\n"); abort(); return E_NOTIMPL;
 }
 
 static HRESULT WINAPI gatt_service3_OpenAsync( IGattDeviceService3 *iface, GattSharingMode mode,
                                                 IAsyncOperation_GattOpenStatus **async )
 {
     FIXME( "(%p, %d, %p): stub!\n", iface, mode, async );
-    return E_NOTIMPL;
+    ERR("!!! E_NOTIMPL - CRASHING!\n"); abort(); return E_NOTIMPL;
 }
 
 static HRESULT WINAPI gatt_service3_GetCharacteristicsWithCacheModeAsync( IGattDeviceService3 *iface,
@@ -4248,10 +4320,13 @@ static HRESULT WINAPI gatt_service3_GetCharacteristicsWithCacheModeAsync( IGattD
                                                                            IAsyncOperation_GattCharacteristicsResult **operation )
 {
     struct gatt_device_service *impl = impl_from_IGattDeviceService3( iface );
-    struct winebth_le_device_get_gatt_characteristics_params *params;
+    struct winebth_le_device_get_gatt_characteristics_params *params = NULL;
+    struct winebth_radio_get_le_device_gatt_characteristics_params *radio_params = NULL;
     IVectorView_GattCharacteristic *chars_vector = NULL;
     IGattCharacteristicsResult *result;
     GattCommunicationStatus status;
+    HANDLE radio_handle = INVALID_HANDLE_VALUE;
+    BOOL use_radio_fallback = FALSE;
     DWORD bytes_returned;
     SIZE_T buffer_size;
     HRESULT hr;
@@ -4263,51 +4338,88 @@ static HRESULT WINAPI gatt_service3_GetCharacteristicsWithCacheModeAsync( IGattD
 
     if (impl->device_handle == INVALID_HANDLE_VALUE)
     {
-        TRACE( " Device handle is invalid ===\n" );
-        status = GattCommunicationStatus_Unreachable;
-        hr = gatt_characteristics_result_create( status, NULL, &result );
-        if (FAILED( hr )) return hr;
-        hr = async_gatt_chars_op_create( result, operation );
-        IGattCharacteristicsResult_Release( result );
-        return hr;
+        TRACE( " Device handle is invalid, trying radio fallback ===\n" );
+        radio_handle = open_first_radio();
+        if (radio_handle == INVALID_HANDLE_VALUE)
+        {
+            TRACE( " Failed to open radio for fallback ===\n" );
+            status = GattCommunicationStatus_Unreachable;
+            hr = gatt_characteristics_result_create( status, NULL, &result );
+            if (FAILED( hr )) return hr;
+            hr = async_gatt_chars_op_create( result, operation );
+            IGattCharacteristicsResult_Release( result );
+            return hr;
+        }
+        use_radio_fallback = TRUE;
     }
 
-    buffer_size = offsetof( struct winebth_le_device_get_gatt_characteristics_params, characteristics[32] );
-    params = malloc( buffer_size );
-    if (!params) return E_OUTOFMEMORY;
+    if (use_radio_fallback)
+    {
+        buffer_size = offsetof( struct winebth_radio_get_le_device_gatt_characteristics_params, characteristics[32] );
+        radio_params = malloc( buffer_size );
+        if (!radio_params)
+        {
+            CloseHandle( radio_handle );
+            return E_OUTOFMEMORY;
+        }
+    }
+    else
+    {
+        buffer_size = offsetof( struct winebth_le_device_get_gatt_characteristics_params, characteristics[32] );
+        params = malloc( buffer_size );
+        if (!params) return E_OUTOFMEMORY;
+    }
 
-    TRACE( " Calling IOCTL_WINEBTH_LE_DEVICE_GET_GATT_CHARACTERISTICS for service uuid=%s ===\n",
-         debugstr_guid( &impl->service_info.ServiceUuid.Value.LongUuid ) );
-    
+    TRACE( " Calling IOCTL for service uuid=%s (use_radio_fallback=%d) ===\n",
+         debugstr_guid( &impl->service_info.ServiceUuid.Value.LongUuid ), use_radio_fallback );
+
 
     status = GattCommunicationStatus_Unreachable;
     for (retry = 0; retry < 10; retry++)
     {
-        memset( params, 0, buffer_size );
-        params->service = impl->service_info;
-        params->count = 0;
-
-        if (DeviceIoControl( impl->device_handle, IOCTL_WINEBTH_LE_DEVICE_GET_GATT_CHARACTERISTICS,
-                             &impl->service_info, sizeof( impl->service_info ),
-                             params, buffer_size, &bytes_returned, NULL ))
+        if (use_radio_fallback)
         {
+            memset( radio_params, 0, buffer_size );
+            radio_params->address = impl->device_address;
+            radio_params->service = impl->service_info;
+            radio_params->count = 0;
+        }
+        else
+        {
+            memset( params, 0, buffer_size );
+            params->service = impl->service_info;
+            params->count = 0;
+        }
+
+        if (use_radio_fallback
+            ? DeviceIoControl( radio_handle, IOCTL_WINEBTH_RADIO_GET_LE_DEVICE_GATT_CHARACTERISTICS,
+                               radio_params, buffer_size, radio_params, buffer_size, &bytes_returned, NULL )
+            : DeviceIoControl( impl->device_handle, IOCTL_WINEBTH_LE_DEVICE_GET_GATT_CHARACTERISTICS,
+                               params, sizeof(*params), params, buffer_size, &bytes_returned, NULL ))
+        {
+            ULONG char_count = use_radio_fallback ? radio_params->count : params->count;
+            BTH_LE_GATT_CHARACTERISTIC *characteristics = use_radio_fallback ? radio_params->characteristics : params->characteristics;
+            HANDLE handle_for_chars = use_radio_fallback ? radio_handle : impl->device_handle;
+
             TRACE( " IOCTL succeeded (retry %d): count=%lu bytes_returned=%lu ===\n",
-                 retry, params->count, bytes_returned );
-            
+                 retry, char_count, bytes_returned );
+
             status = GattCommunicationStatus_Success;
-            if (params->count > 0)
+            if (char_count > 0)
             {
-                hr = gatt_characteristics_vector_create( params->characteristics, params->count,
-                                                          &impl->service_info, impl->device_handle, &chars_vector );
+                hr = gatt_characteristics_vector_create( characteristics, char_count,
+                                                          &impl->service_info, handle_for_chars, &chars_vector );
                 if (FAILED( hr ))
                 {
                     TRACE( " Failed to create characteristics vector: hr=0x%lx ===\n", hr );
-                    
+
                     free( params );
+                    free( radio_params );
+                    if (use_radio_fallback) CloseHandle( radio_handle );
                     return hr;
                 }
-                TRACE( " Created characteristics vector with %lu characteristics ===\n", params->count );
-                
+                TRACE( " Created characteristics vector with %lu characteristics ===\n", char_count );
+
                 break;
             }
             else
@@ -4327,6 +4439,8 @@ static HRESULT WINAPI gatt_service3_GetCharacteristicsWithCacheModeAsync( IGattD
     }
 
     free( params );
+    free( radio_params );
+    if (use_radio_fallback) CloseHandle( radio_handle );
 
     hr = gatt_characteristics_result_create( status, chars_vector, &result );
     if (chars_vector)
@@ -4349,7 +4463,7 @@ static HRESULT WINAPI gatt_service3_GetCharacteristicsForUuidAsync( IGattDeviceS
                                                                      IAsyncOperation_GattCharacteristicsResult **async )
 {
     FIXME( "(%p, %s, %p): stub!\n", iface, debugstr_guid( &uuid ), async );
-    return E_NOTIMPL;
+    ERR("!!! E_NOTIMPL - CRASHING!\n"); abort(); return E_NOTIMPL;
 }
 
 static HRESULT WINAPI gatt_service3_GetCharacteristicsForUuidWithCacheModeAsync( IGattDeviceService3 *iface,
@@ -4357,14 +4471,14 @@ static HRESULT WINAPI gatt_service3_GetCharacteristicsForUuidWithCacheModeAsync(
                                                                                   IAsyncOperation_GattCharacteristicsResult **async )
 {
     FIXME( "(%p, %s, %d, %p): stub!\n", iface, debugstr_guid( &uuid ), mode, async );
-    return E_NOTIMPL;
+    ERR("!!! E_NOTIMPL - CRASHING!\n"); abort(); return E_NOTIMPL;
 }
 
 static HRESULT WINAPI gatt_service3_GetIncludedServicesAsync( IGattDeviceService3 *iface,
                                                                IAsyncOperation_GattDeviceServicesResult **async )
 {
     FIXME( "(%p, %p): stub!\n", iface, async );
-    return E_NOTIMPL;
+    ERR("!!! E_NOTIMPL - CRASHING!\n"); abort(); return E_NOTIMPL;
 }
 
 static HRESULT WINAPI gatt_service3_GetIncludedServicesWithCacheModeAsync( IGattDeviceService3 *iface,
@@ -4372,14 +4486,14 @@ static HRESULT WINAPI gatt_service3_GetIncludedServicesWithCacheModeAsync( IGatt
                                                                             IAsyncOperation_GattDeviceServicesResult **async )
 {
     FIXME( "(%p, %d, %p): stub!\n", iface, mode, async );
-    return E_NOTIMPL;
+    ERR("!!! E_NOTIMPL - CRASHING!\n"); abort(); return E_NOTIMPL;
 }
 
 static HRESULT WINAPI gatt_service3_GetIncludedServicesForUuidAsync( IGattDeviceService3 *iface, GUID uuid,
                                                                       IAsyncOperation_GattDeviceServicesResult **async )
 {
     FIXME( "(%p, %s, %p): stub!\n", iface, debugstr_guid( &uuid ), async );
-    return E_NOTIMPL;
+    ERR("!!! E_NOTIMPL - CRASHING!\n"); abort(); return E_NOTIMPL;
 }
 
 static HRESULT WINAPI gatt_service3_GetIncludedServicesForUuidWithCacheModeAsync( IGattDeviceService3 *iface,
@@ -4387,7 +4501,7 @@ static HRESULT WINAPI gatt_service3_GetIncludedServicesForUuidWithCacheModeAsync
                                                                                    IAsyncOperation_GattDeviceServicesResult **async )
 {
     FIXME( "(%p, %s, %d, %p): stub!\n", iface, debugstr_guid( &uuid ), mode, async );
-    return E_NOTIMPL;
+    ERR("!!! E_NOTIMPL - CRASHING!\n"); abort(); return E_NOTIMPL;
 }
 
 static const IGattDeviceService3Vtbl gatt_device_service3_vtbl =
@@ -4414,7 +4528,8 @@ static const IGattDeviceService3Vtbl gatt_device_service3_vtbl =
 };
 
 static HRESULT gatt_device_service_create( HANDLE device_handle, const BTH_LE_GATT_SERVICE *service_info,
-                                            const WCHAR *device_id, IGattDeviceService **out )
+                                            const WCHAR *device_id, UINT64 device_address,
+                                            IGattDeviceService **out )
 {
     struct gatt_device_service *impl;
     if (!(impl = calloc( 1, sizeof( *impl ) ))) return E_OUTOFMEMORY;
@@ -4424,6 +4539,7 @@ static HRESULT gatt_device_service_create( HANDLE device_handle, const BTH_LE_GA
     impl->ref = 1;
     impl->device_handle = device_handle;
     impl->service_info = *service_info;
+    impl->device_address = device_address;
     if (device_id)
     {
         impl->device_id = wcsdup( device_id );
@@ -4495,13 +4611,13 @@ static ULONG WINAPI gatt_services_iterator_Release( IIterator_GattDeviceService 
 static HRESULT WINAPI gatt_services_iterator_GetIids( IIterator_GattDeviceService *iface, ULONG *iid_count, IID **iids )
 {
     FIXME( "(%p, %p, %p): stub!\n", iface, iid_count, iids );
-    return E_NOTIMPL;
+    ERR("!!! E_NOTIMPL - CRASHING!\n"); abort(); return E_NOTIMPL;
 }
 
 static HRESULT WINAPI gatt_services_iterator_GetRuntimeClassName( IIterator_GattDeviceService *iface, HSTRING *class_name )
 {
     FIXME( "(%p, %p): stub!\n", iface, class_name );
-    return E_NOTIMPL;
+    ERR("!!! E_NOTIMPL - CRASHING!\n"); abort(); return E_NOTIMPL;
 }
 
 static HRESULT WINAPI gatt_services_iterator_GetTrustLevel( IIterator_GattDeviceService *iface, TrustLevel *level )
@@ -4574,6 +4690,7 @@ struct gatt_services_vector
     BTH_LE_GATT_SERVICE *services;
     HANDLE device_handle;
     WCHAR *device_id;
+    UINT64 device_address;
 };
 
 static inline struct gatt_services_vector *impl_from_IVectorView_GattDeviceService( IVectorView_GattDeviceService *iface )
@@ -4607,13 +4724,13 @@ static ULONG WINAPI gatt_services_iterable_Release( IIterable_GattDeviceService 
 static HRESULT WINAPI gatt_services_iterable_GetIids( IIterable_GattDeviceService *iface, ULONG *iid_count, IID **iids )
 {
     FIXME( "(%p, %p, %p): stub!\n", iface, iid_count, iids );
-    return E_NOTIMPL;
+    ERR("!!! E_NOTIMPL - CRASHING!\n"); abort(); return E_NOTIMPL;
 }
 
 static HRESULT WINAPI gatt_services_iterable_GetRuntimeClassName( IIterable_GattDeviceService *iface, HSTRING *class_name )
 {
     FIXME( "(%p, %p): stub!\n", iface, class_name );
-    return E_NOTIMPL;
+    ERR("!!! E_NOTIMPL - CRASHING!\n"); abort(); return E_NOTIMPL;
 }
 
 static HRESULT WINAPI gatt_services_iterable_GetTrustLevel( IIterable_GattDeviceService *iface, TrustLevel *level )
@@ -4705,13 +4822,13 @@ static ULONG WINAPI gatt_services_vector_Release( IVectorView_GattDeviceService 
 static HRESULT WINAPI gatt_services_vector_GetIids( IVectorView_GattDeviceService *iface, ULONG *iid_count, IID **iids )
 {
     FIXME( "(%p, %p, %p): stub!\n", iface, iid_count, iids );
-    return E_NOTIMPL;
+    ERR("!!! E_NOTIMPL - CRASHING!\n"); abort(); return E_NOTIMPL;
 }
 
 static HRESULT WINAPI gatt_services_vector_GetRuntimeClassName( IVectorView_GattDeviceService *iface, HSTRING *class_name )
 {
     FIXME( "(%p, %p): stub!\n", iface, class_name );
-    return E_NOTIMPL;
+    ERR("!!! E_NOTIMPL - CRASHING!\n"); abort(); return E_NOTIMPL;
 }
 
 static HRESULT WINAPI gatt_services_vector_GetTrustLevel( IVectorView_GattDeviceService *iface, TrustLevel *level )
@@ -4734,7 +4851,7 @@ static HRESULT WINAPI gatt_services_vector_GetAt( IVectorView_GattDeviceService 
         TRACE( " gatt_services_vector_GetAt: index %u >= count %lu, returning E_BOUNDS ===\n", index, impl->count );
         return E_BOUNDS;
     }
-    hr = gatt_device_service_create( impl->device_handle, &impl->services[index], impl->device_id, value );
+    hr = gatt_device_service_create( impl->device_handle, &impl->services[index], impl->device_id, impl->device_address, value );
     TRACE( " gatt_services_vector_GetAt: created service, hr=0x%08lx ===\n", hr );
     return hr;
 }
@@ -4779,7 +4896,7 @@ static HRESULT WINAPI gatt_services_vector_GetMany( IVectorView_GattDeviceServic
 
     for (i = 0; i < to_copy; i++)
     {
-        hr = gatt_device_service_create( impl->device_handle, &impl->services[start_index + i], impl->device_id, &items[i] );
+        hr = gatt_device_service_create( impl->device_handle, &impl->services[start_index + i], impl->device_id, impl->device_address, &items[i] );
         if (FAILED( hr ))
         {
             while (i > 0)
@@ -4813,6 +4930,7 @@ static const struct IVectorView_GattDeviceServiceVtbl gatt_services_vector_vtbl 
 
 static HRESULT gatt_services_vector_create( BTH_LE_GATT_SERVICE *services, ULONG count,
                                              HANDLE device_handle, const WCHAR *device_id,
+                                             UINT64 device_address,
                                              IVectorView_GattDeviceService **out )
 {
     struct gatt_services_vector *impl;
@@ -4822,6 +4940,7 @@ static HRESULT gatt_services_vector_create( BTH_LE_GATT_SERVICE *services, ULONG
     impl->ref = 1;
     impl->count = count;
     impl->device_handle = device_handle;
+    impl->device_address = device_address;
     if (device_id)
     {
         impl->device_id = wcsdup( device_id );
@@ -4852,6 +4971,7 @@ struct gatt_services_result
     LONG ref;
     GattCommunicationStatus status;
     IVectorView_GattDeviceService *services_vector;
+    BOOL services_accessed;  /* Track if get_Services was called */
 };
 
 static inline struct gatt_services_result *impl_from_IGattDeviceServicesResult( IGattDeviceServicesResult *iface )
@@ -4862,7 +4982,7 @@ static inline struct gatt_services_result *impl_from_IGattDeviceServicesResult( 
 static HRESULT WINAPI gatt_result_QueryInterface( IGattDeviceServicesResult *iface, REFIID iid, void **out )
 {
     struct gatt_services_result *impl = impl_from_IGattDeviceServicesResult( iface );
-    TRACE( " gatt_result_QueryInterface: iface=%p iid=%s ===\n", iface, debugstr_guid( iid ) );
+    ERR( "!!! gatt_result_QueryInterface: iface=%p iid=%s ===\n", iface, debugstr_guid( iid ) );
 
     if (IsEqualGUID( iid, &IID_IUnknown ) ||
         IsEqualGUID( iid, &IID_IInspectable ) ||
@@ -4870,11 +4990,11 @@ static HRESULT WINAPI gatt_result_QueryInterface( IGattDeviceServicesResult *ifa
         IsEqualGUID( iid, &IID_IGattDeviceServicesResult ))
     {
         IGattDeviceServicesResult_AddRef( (*out = &impl->IGattDeviceServicesResult_iface) );
-        TRACE( " gatt_result_QueryInterface: SUCCESS ===\n" );
+        ERR( "!!! gatt_result_QueryInterface: SUCCESS for %s ===\n", debugstr_guid( iid ) );
         return S_OK;
     }
     *out = NULL;
-    TRACE( " gatt_result_QueryInterface: E_NOINTERFACE for %s ===\n", debugstr_guid( iid ) );
+    ERR( "!!! gatt_result_QueryInterface: E_NOINTERFACE for %s ===\n", debugstr_guid( iid ) );
     return E_NOINTERFACE;
 }
 
@@ -4890,10 +5010,10 @@ static ULONG WINAPI gatt_result_Release( IGattDeviceServicesResult *iface )
 {
     struct gatt_services_result *impl = impl_from_IGattDeviceServicesResult( iface );
     ULONG ref = InterlockedDecrement( &impl->ref );
-    TRACE( " gatt_result_Release: iface=%p ref=%lu ===\n", iface, ref );
+    ERR( "!!! gatt_result_Release: iface=%p ref=%lu ===\n", iface, ref );
     if (!ref)
     {
-        TRACE( " gatt_result_Release: DESTROYING result object! ===\n" );
+        TRACE( "gatt_result_Release: DESTROYING result object! services_accessed=%d\n", impl->services_accessed );
         if (impl->services_vector)
             IVectorView_GattDeviceService_Release( impl->services_vector );
         free( impl );
@@ -4904,8 +5024,16 @@ static ULONG WINAPI gatt_result_Release( IGattDeviceServicesResult *iface )
 static HRESULT WINAPI gatt_result_GetIids( IGattDeviceServicesResult *iface, ULONG *iid_count, IID **iids )
 {
     TRACE( " gatt_result_GetIids: iface=%p ===\n", iface );
-    FIXME( "(%p, %p, %p): stub!\n", iface, iid_count, iids );
-    return E_NOTIMPL;
+    FIXME( "(%p, %p, %p): semi-stub!\n", iface, iid_count, iids );
+
+    if (!iid_count || !iids) return E_POINTER;
+
+    *iid_count = 1;
+    *iids = CoTaskMemAlloc( sizeof(IID) );
+    if (!*iids) return E_OUTOFMEMORY;
+
+    (*iids)[0] = IID_IGattDeviceServicesResult;
+    return S_OK;
 }
 
 static HRESULT WINAPI gatt_result_GetRuntimeClassName( IGattDeviceServicesResult *iface, HSTRING *class_name )
@@ -4929,6 +5057,8 @@ static HRESULT WINAPI gatt_result_GetTrustLevel( IGattDeviceServicesResult *ifac
 static HRESULT WINAPI gatt_result_get_Status( IGattDeviceServicesResult *iface, GattCommunicationStatus *value )
 {
     struct gatt_services_result *impl = impl_from_IGattDeviceServicesResult( iface );
+    fprintf( stderr, "!!! gatt_result_get_Status CALLED !!! iface=%p status=%d\n", iface, impl->status );
+    fflush( stderr );
     ERR( " gatt_result_get_Status: iface=%p status=%d (0=Success, 1=Unreachable, 2=ProtocolError, 3=AccessDenied) ===\n", iface, impl->status );
 
     if (!value) return E_POINTER;
@@ -4947,9 +5077,9 @@ static HRESULT WINAPI gatt_result_get_ProtocolError( IGattDeviceServicesResult *
 static HRESULT WINAPI gatt_result_get_Services( IGattDeviceServicesResult *iface, IVectorView_GattDeviceService **value )
 {
     struct gatt_services_result *impl = impl_from_IGattDeviceServicesResult( iface );
-    TRACE( " gatt_result_get_Services: iface=%p services_vector=%p ===\n", iface, impl->services_vector );
-    FIXME( "gatt_result_get_Services: iface=%p services_vector=%p\n", iface, impl->services_vector );
-    
+    ERR( "!!! gatt_result_get_Services: CALLED! iface=%p services_vector=%p ===\n", iface, impl->services_vector );
+    impl->services_accessed = TRUE;
+
     if (!value) return E_POINTER;
     if (impl->services_vector)
     {
@@ -5058,8 +5188,16 @@ static ULONG WINAPI async_gatt_op_Release( IAsyncOperation_GattDeviceServicesRes
 
 static HRESULT WINAPI async_gatt_op_GetIids( IAsyncOperation_GattDeviceServicesResult *iface, ULONG *iid_count, IID **iids )
 {
-    FIXME( "(%p, %p, %p): stub!\n", iface, iid_count, iids );
-    return E_NOTIMPL;
+    FIXME( "(%p, %p, %p): semi-stub!\n", iface, iid_count, iids );
+
+    if (!iid_count || !iids) return E_POINTER;
+
+    *iid_count = 1;
+    *iids = CoTaskMemAlloc( sizeof(IID) );
+    if (!*iids) return E_OUTOFMEMORY;
+
+    (*iids)[0] = IID_IAsyncOperation_GattDeviceServicesResult;
+    return S_OK;
 }
 
 static HRESULT WINAPI async_gatt_op_GetRuntimeClassName( IAsyncOperation_GattDeviceServicesResult *iface, HSTRING *class_name )
@@ -5091,8 +5229,11 @@ static HRESULT WINAPI async_gatt_op_put_Completed( IAsyncOperation_GattDeviceSer
     current_status = impl->status;
     if (current_status != Started)
     {
-        FIXME( " put_Completed: Operation already complete (status=%d), invoking handler immediately ===\n", current_status );
-        IAsyncOperationCompletedHandler_GattDeviceServicesResult_Invoke( handler, iface, current_status );
+        HRESULT hr;
+        ERR( " put_Completed: Operation already complete (status=%d), invoking handler immediately ===\n", current_status );
+        ERR( " put_Completed: About to call Invoke on handler %p with iface=%p status=%d ===\n", handler, iface, current_status );
+        hr = IAsyncOperationCompletedHandler_GattDeviceServicesResult_Invoke( handler, iface, current_status );
+        ERR( " put_Completed: Invoke returned hr=0x%08lx ===\n", (unsigned long)hr );
     }
     else
     {
@@ -5125,9 +5266,12 @@ static HRESULT WINAPI async_gatt_op_GetResults( IAsyncOperation_GattDeviceServic
         struct gatt_services_result *res_impl = impl_from_IGattDeviceServicesResult( *results );
         ERR( " async_gatt_op_GetResults: result GattCommunicationStatus=%d (0=Success,1=Unreachable) services_vector=%p ===\n",
              res_impl->status, res_impl->services_vector );
+        ERR( " async_gatt_op_GetResults: result pointer=%p vtable=%p ===\n", *results, (*results)->lpVtbl );
+        ERR( " async_gatt_op_GetResults: vtable->get_Status=%p (should be at offset 0x30) ===\n", (*results)->lpVtbl->get_Status );
+        ERR( " async_gatt_op_GetResults: vtable->get_Services=%p (should be at offset 0x40) ===\n", (*results)->lpVtbl->get_Services );
         IGattDeviceServicesResult_AddRef( *results );
     }
-    ERR( " async_gatt_op_GetResults: returning result=%p ===\n", *results );
+    ERR( " async_gatt_op_GetResults: returning result=%p HRESULT=0x%08x (S_OK) ===\n", *results, S_OK );
 
     return S_OK;
 }
@@ -5291,13 +5435,13 @@ static HRESULT WINAPI le_device3_get_DeviceAccessInformation( IBluetoothLEDevice
 {
     FIXME( "(%p, %p) stub!\n", iface, value );
     *value = NULL;
-    return E_NOTIMPL;
+    ERR("!!! E_NOTIMPL - CRASHING!\n"); abort(); return E_NOTIMPL;
 }
 
 static HRESULT WINAPI le_device3_RequestAccessAsync( IBluetoothLEDevice3 *iface, IAsyncOperation_IInspectable **operation )
 {
     FIXME( "(%p, %p) stub!\n", iface, operation );
-    return E_NOTIMPL;
+    ERR("!!! E_NOTIMPL - CRASHING!\n"); abort(); return E_NOTIMPL;
 }
 
 struct gatt_services_async_ctx
@@ -5315,6 +5459,7 @@ static DWORD WINAPI gatt_services_thread( void *arg )
     struct bluetooth_le_device *impl = impl_from_IBluetoothLEDevice3( ctx->iface );
     struct async_gatt_services_op *op_impl = impl_from_IAsyncOperation_GattDeviceServicesResult( ctx->op );
     struct winebth_le_device_get_gatt_services_params *params = NULL;
+    struct winebth_radio_get_le_device_gatt_services_params *radio_params = NULL;
     IVectorView_GattDeviceService *services_vector = NULL;
     IGattDeviceServicesResult *result;
     GattCommunicationStatus status = GattCommunicationStatus_Unreachable;
@@ -5322,41 +5467,75 @@ static DWORD WINAPI gatt_services_thread( void *arg )
     SIZE_T buffer_size;
     HRESULT hr;
     int retries = 0;
-    const int max_retries = 10;
+    const int max_retries = 50;
+    HANDLE radio_handle = INVALID_HANDLE_VALUE;
+    BOOL use_radio_fallback = FALSE;
 
     CoInitializeEx( NULL, COINIT_MULTITHREADED );
-    TRACE( "gatt_services_thread: started device=%p handle=%p\n", impl, impl->device_handle );
+    TRACE( "gatt_services_thread: started device=%p handle=%p address=%I64x\n", impl, impl->device_handle, impl->address );
 
     if (impl->device_handle == INVALID_HANDLE_VALUE)
     {
-        ERR( "gatt_services_thread: device handle invalid\n" );
-        goto done;
+        TRACE( "gatt_services_thread: device handle invalid, trying radio fallback\n" );
+        radio_handle = open_first_radio();
+        if (radio_handle == INVALID_HANDLE_VALUE)
+        {
+            ERR( "gatt_services_thread: failed to open radio for fallback\n" );
+            goto done;
+        }
+        use_radio_fallback = TRUE;
     }
 
-    buffer_size = offsetof( struct winebth_le_device_get_gatt_services_params, services[16] );
-    params = malloc( buffer_size );
-    if (!params) goto done;
+    if (use_radio_fallback)
+    {
+        buffer_size = offsetof( struct winebth_radio_get_le_device_gatt_services_params, services[16] );
+        radio_params = malloc( buffer_size );
+        if (!radio_params) goto done;
+    }
+    else
+    {
+        buffer_size = offsetof( struct winebth_le_device_get_gatt_services_params, services[16] );
+        params = malloc( buffer_size );
+        if (!params) goto done;
+    }
 
 retry:
-    memset( params, 0, buffer_size );
-    params->count = 0;
-
-    TRACE( "gatt_services_thread: calling IOCTL\n" );
-    if (DeviceIoControl( impl->device_handle, IOCTL_WINEBTH_LE_DEVICE_GET_GATT_SERVICES, NULL, 0,
-                         params, buffer_size, &bytes_returned, NULL ))
+    if (use_radio_fallback)
     {
-        TRACE( "gatt_services_thread: IOCTL OK count=%lu mode=%d retry=%d filter=%d\n", params->count, ctx->mode, retries, ctx->has_filter_uuid );
+        memset( radio_params, 0, buffer_size );
+        radio_params->address = impl->address;
+        radio_params->count = 0;
+    }
+    else
+    {
+        memset( params, 0, buffer_size );
+        params->count = 0;
+    }
+
+    TRACE( "gatt_services_thread: calling IOCTL (use_radio_fallback=%d)\n", use_radio_fallback );
+
+    if (use_radio_fallback
+        ? DeviceIoControl( radio_handle, IOCTL_WINEBTH_RADIO_GET_LE_DEVICE_GATT_SERVICES,
+                           radio_params, buffer_size, radio_params, buffer_size, &bytes_returned, NULL )
+        : DeviceIoControl( impl->device_handle, IOCTL_WINEBTH_LE_DEVICE_GET_GATT_SERVICES, NULL, 0,
+                           params, buffer_size, &bytes_returned, NULL ))
+    {
+        ULONG svc_count = use_radio_fallback ? radio_params->count : params->count;
+        BTH_LE_GATT_SERVICE *services = use_radio_fallback ? radio_params->services : params->services;
+        HANDLE handle_for_services = use_radio_fallback ? radio_handle : impl->device_handle;
+
+        TRACE( "gatt_services_thread: IOCTL OK count=%lu mode=%d retry=%d filter=%d\n", svc_count, ctx->mode, retries, ctx->has_filter_uuid );
         status = GattCommunicationStatus_Success;
 
-        if (ctx->mode == BluetoothCacheMode_Uncached && params->count == 0 && retries < max_retries)
+        if (ctx->mode == BluetoothCacheMode_Uncached && svc_count == 0 && retries < max_retries)
         {
              TRACE( "Uncached mode and 0 services, waiting... (retry %d/%d)\n", retries+1, max_retries );
-             Sleep( 50 );
+             Sleep( 100 );
              retries++;
              goto retry;
         }
 
-        if (params->count > 0)
+        if (svc_count > 0)
         {
             if (ctx->has_filter_uuid)
             {
@@ -5364,32 +5543,32 @@ retry:
                 ULONG filtered_count = 0;
                 ULONG i;
                 TRACE( "gatt_services_thread: filtering for UUID %s\n", debugstr_guid( &ctx->filter_uuid ) );
-                for (i = 0; i < params->count && filtered_count < 16; i++)
+                for (i = 0; i < svc_count && filtered_count < 16; i++)
                 {
                     GUID svc_guid;
-                    if (params->services[i].ServiceUuid.IsShortUuid)
+                    if (services[i].ServiceUuid.IsShortUuid)
                     {
                         memset( &svc_guid, 0, sizeof(svc_guid) );
-                        svc_guid.Data1 = params->services[i].ServiceUuid.Value.ShortUuid;
+                        svc_guid.Data1 = services[i].ServiceUuid.Value.ShortUuid;
                         svc_guid.Data4[4] = 0x00; svc_guid.Data4[5] = 0x80;
                         svc_guid.Data4[6] = 0x5f; svc_guid.Data4[7] = 0x9b;
                     }
                     else
                     {
-                        svc_guid = params->services[i].ServiceUuid.Value.LongUuid;
+                        svc_guid = services[i].ServiceUuid.Value.LongUuid;
                     }
                     TRACE( "gatt_services_thread: service[%lu] UUID=%s\n", i, debugstr_guid( &svc_guid ) );
                     if (IsEqualGUID( &svc_guid, &ctx->filter_uuid ))
                     {
                         TRACE( "gatt_services_thread: matched service at index %lu\n", i );
-                        filtered_services[filtered_count++] = params->services[i];
+                        filtered_services[filtered_count++] = services[i];
                     }
                 }
-                TRACE( "gatt_services_thread: filtered %lu -> %lu services\n", params->count, filtered_count );
+                TRACE( "gatt_services_thread: filtered %lu -> %lu services\n", svc_count, filtered_count );
                 if (filtered_count > 0)
                 {
-                    hr = gatt_services_vector_create( filtered_services, filtered_count, impl->device_handle,
-                                                       WindowsGetStringRawBuffer( impl->id, NULL ), &services_vector );
+                    hr = gatt_services_vector_create( filtered_services, filtered_count, handle_for_services,
+                                                       WindowsGetStringRawBuffer( impl->id, NULL ), impl->address, &services_vector );
                 }
                 else
                 {
@@ -5398,8 +5577,8 @@ retry:
             }
             else
             {
-                hr = gatt_services_vector_create( params->services, params->count, impl->device_handle,
-                                                   WindowsGetStringRawBuffer( impl->id, NULL ), &services_vector );
+                hr = gatt_services_vector_create( services, svc_count, handle_for_services,
+                                                   WindowsGetStringRawBuffer( impl->id, NULL ), impl->address, &services_vector );
             }
             if (FAILED( hr ))
             {
@@ -5418,6 +5597,8 @@ retry:
 done:
     TRACE( "gatt_services_thread: done, gatt_status=%d\n", status );
     if (params) free( params );
+    if (radio_params) free( radio_params );
+    if (radio_handle != INVALID_HANDLE_VALUE) CloseHandle( radio_handle );
 
     hr = gatt_services_result_create( status, services_vector, &result );
     if (services_vector) IVectorView_GattDeviceService_Release( services_vector );
@@ -5438,8 +5619,15 @@ done:
     if (op_impl->handler)
     {
         HRESULT invoke_hr;
+        ERR( "gatt_services_thread: ABOUT TO INVOKE HANDLER handler=%p op=%p status=%d ===\n",
+             op_impl->handler, ctx->op, op_impl->status );
         invoke_hr = IAsyncOperationCompletedHandler_GattDeviceServicesResult_Invoke( op_impl->handler, ctx->op, op_impl->status );
+        ERR( "gatt_services_thread: HANDLER INVOKE RETURNED hr=0x%lx ===\n", invoke_hr );
         TRACE( "gatt_services_thread: handler returned hr=0x%lx\n", invoke_hr );
+    }
+    else
+    {
+        ERR( "gatt_services_thread: NO HANDLER TO INVOKE ===\n" );
     }
 
     TRACE( "gatt_services_thread: done final_status=%d\n", op_impl->status );
@@ -5454,47 +5642,143 @@ static HRESULT WINAPI le_device3_GetGattServicesWithCacheModeAsync( IBluetoothLE
                                                                     BluetoothCacheMode cacheMode,
                                                                     IAsyncOperation_GattDeviceServicesResult **operation )
 {
-    struct gatt_services_async_ctx *ctx;
-    HANDLE thread;
+    struct bluetooth_le_device *impl = impl_from_IBluetoothLEDevice3( iface );
+    struct winebth_le_device_get_gatt_services_params *params = NULL;
+    struct winebth_radio_get_le_device_gatt_services_params *radio_params = NULL;
+    IVectorView_GattDeviceService *services_vector = NULL;
+    IGattDeviceServicesResult *result = NULL;
+    GattCommunicationStatus status = GattCommunicationStatus_Unreachable;
+    struct async_gatt_services_op *op_impl;
+    HANDLE radio_handle = INVALID_HANDLE_VALUE;
+    BOOL use_radio_fallback = FALSE;
+    DWORD bytes_returned;
+    SIZE_T buffer_size;
     HRESULT hr;
+    ULONG service_count = 0;
 
-    FIXME( "=== GetGattServicesWithCacheModeAsync: iface=%p, cacheMode=%d ===\n", iface, cacheMode );
+    TRACE( "=== GetGattServicesWithCacheModeAsync: iface=%p, cacheMode=%d (SYNCHRONOUS) ===\n", iface, cacheMode );
     if (!operation) return E_POINTER;
 
-    hr = async_gatt_services_op_create( NULL, operation );
-    if (FAILED( hr )) {
-        FIXME( "=== GetGattServicesWithCacheModeAsync: async_gatt_services_op_create FAILED: hr=0x%lx ===\n", hr );
+    /* NEW APPROACH: Do service discovery SYNCHRONOUSLY before creating async operation.
+     * Windows GetGattServicesAsync returns an operation that's ALREADY completed with cached services.
+     * C++/WinRT co_await sees status=Completed, await_ready returns true, NO suspension needed! */
+
+    /* Check if we need radio fallback */
+    if (impl->device_handle == INVALID_HANDLE_VALUE)
+    {
+        TRACE( "=== Device handle invalid, using radio fallback ===\n" );
+        radio_handle = open_first_radio();
+        if (radio_handle == INVALID_HANDLE_VALUE)
+        {
+            ERR( "Failed to open radio for fallback\n" );
+            goto create_failed_operation;
+        }
+        use_radio_fallback = TRUE;
+    }
+
+    if (use_radio_fallback)
+    {
+        buffer_size = offsetof( struct winebth_radio_get_le_device_gatt_services_params, services[16] );
+        radio_params = malloc( buffer_size );
+        if (!radio_params)
+        {
+            CloseHandle( radio_handle );
+            return E_OUTOFMEMORY;
+        }
+        memset( radio_params, 0, buffer_size );
+        radio_params->address = impl->address;
+        radio_params->count = 0;
+
+        TRACE( "=== Calling IOCTL_WINEBTH_RADIO_GET_LE_DEVICE_GATT_SERVICES (addr=%I64x)... ===\n", impl->address );
+        if (DeviceIoControl( radio_handle, IOCTL_WINEBTH_RADIO_GET_LE_DEVICE_GATT_SERVICES,
+                             radio_params, buffer_size, radio_params, buffer_size, &bytes_returned, NULL ))
+        {
+            TRACE( "=== IOCTL OK, count=%lu ===\n", radio_params->count );
+            status = GattCommunicationStatus_Success;
+            service_count = radio_params->count;
+
+            if (radio_params->count > 0)
+            {
+                hr = gatt_services_vector_create( radio_params->services, radio_params->count, radio_handle,
+                                                   WindowsGetStringRawBuffer( impl->id, NULL ), impl->address, &services_vector );
+                if (FAILED( hr ))
+                {
+                    ERR( "Failed to create services vector: hr=0x%lx\n", hr );
+                    status = GattCommunicationStatus_Unreachable;
+                }
+            }
+        }
+        else
+        {
+            DWORD err = GetLastError();
+            ERR( "IOCTL failed: error=%lu\n", err );
+        }
+
+        free( radio_params );
+        CloseHandle( radio_handle );
+    }
+    else
+    {
+        buffer_size = offsetof( struct winebth_le_device_get_gatt_services_params, services[16] );
+        params = malloc( buffer_size );
+        if (!params) return E_OUTOFMEMORY;
+
+        memset( params, 0, buffer_size );
+        params->count = 0;
+
+        TRACE( "=== Calling IOCTL_WINEBTH_LE_DEVICE_GET_GATT_SERVICES... ===\n" );
+        if (DeviceIoControl( impl->device_handle, IOCTL_WINEBTH_LE_DEVICE_GET_GATT_SERVICES, NULL, 0,
+                             params, buffer_size, &bytes_returned, NULL ))
+        {
+            TRACE( "=== IOCTL OK, count=%lu ===\n", params->count );
+            status = GattCommunicationStatus_Success;
+            service_count = params->count;
+
+            if (params->count > 0)
+            {
+                hr = gatt_services_vector_create( params->services, params->count, impl->device_handle,
+                                                   WindowsGetStringRawBuffer( impl->id, NULL ), impl->address, &services_vector );
+                if (FAILED( hr ))
+                {
+                    ERR( "Failed to create services vector: hr=0x%lx\n", hr );
+                    status = GattCommunicationStatus_Unreachable;
+                }
+            }
+        }
+        else
+        {
+            DWORD err = GetLastError();
+            ERR( "IOCTL failed: error=%lu\n", err );
+        }
+
+        free( params );
+    }
+
+create_failed_operation:
+
+    /* Create result with discovered services */
+    hr = gatt_services_result_create( status, services_vector, &result );
+    if (services_vector) IVectorView_GattDeviceService_Release( services_vector );
+    if (FAILED( hr ))
+    {
+        ERR( "Failed to create result: hr=0x%lx\n", hr );
         return hr;
     }
 
-    ctx = malloc( sizeof( *ctx ) );
-    if (!ctx)
+    /* Create async operation that's ALREADY completed */
+    hr = async_gatt_services_op_create( result, operation );
+    IGattDeviceServicesResult_Release( result );  /* op took its own ref */
+    if (FAILED( hr ))
     {
-        IAsyncOperation_GattDeviceServicesResult_Release( *operation );
-        return E_OUTOFMEMORY;
+        ERR( "Failed to create async operation: hr=0x%lx\n", hr );
+        return hr;
     }
 
-    ctx->iface = iface;
-    IBluetoothLEDevice3_AddRef( iface );
-    ctx->op = *operation;
-    IAsyncOperation_GattDeviceServicesResult_AddRef( *operation );
-    ctx->mode = cacheMode;
-    ctx->has_filter_uuid = FALSE;
-    memset( &ctx->filter_uuid, 0, sizeof(ctx->filter_uuid) );
+    /* Mark as Completed so await_ready returns true immediately */
+    op_impl = impl_from_IAsyncOperation_GattDeviceServicesResult( *operation );
+    op_impl->status = Completed;
 
-    FIXME( "=== GetGattServicesWithCacheModeAsync: creating thread... ===\n" );
-    thread = CreateThread( NULL, 0, gatt_services_thread, ctx, 0, NULL );
-    if (!thread)
-    {
-        DWORD err = GetLastError();
-        FIXME( "=== GetGattServicesWithCacheModeAsync: CreateThread FAILED: err=%lu ===\n", err );
-        IBluetoothLEDevice3_Release( iface );
-        IAsyncOperation_GattDeviceServicesResult_Release( *operation );
-        free( ctx );
-        return HRESULT_FROM_WIN32( err );
-    }
-    FIXME( "=== GetGattServicesWithCacheModeAsync: thread created, handle=%p ===\n", thread );
-    CloseHandle( thread );
+    TRACE( "=== Returning ALREADY-COMPLETED async operation with %lu services ===\n", service_count );
 
     return S_OK;
 }
@@ -5613,7 +5897,7 @@ static HANDLE open_le_device_interface( UINT64 address )
 
     TRACE( " open_le_device_interface: searching for address %I64x (48-bit: %I64x, str: %s, swapped: %s) ===\n", address, addr_48, debugstr_w( addr_str ), debugstr_w( addr_str_swapped ) );
 
-    for (retry = 0; retry < 10; retry++)
+    for (retry = 0; retry < 2; retry++)
     {
         idx = 0;
         devinfo = SetupDiGetClassDevsW( &btle_device_interface_guid, NULL, NULL,
@@ -5621,7 +5905,7 @@ static HANDLE open_le_device_interface( UINT64 address )
         if (devinfo == INVALID_HANDLE_VALUE)
         {
             TRACE( " SetupDiGetClassDevsW failed ===\n" );
-            Sleep( 200 );
+            Sleep( 10 );
             continue;
         }
 
@@ -5637,30 +5921,47 @@ static HANDLE open_le_device_interface( UINT64 address )
                 TRACE( " Found device interface path: %s ===\n", debugstr_w( iface_detail->DevicePath ) );
 
             {
-                const WCHAR *addr_ptr = wcsstr( iface_detail->DevicePath, L"&" );
-                if (!addr_ptr) addr_ptr = wcsstr( iface_detail->DevicePath, L"_" );
+                /* Try multiple delimiters: & (legacy), _ (alt), # (reference string from IoRegisterDeviceInterface) */
+                const WCHAR *delims[] = { L"&", L"_", L"#" };
+                const WCHAR *addr_ptr = NULL;
+                int d;
+                for (d = 0; d < 3 && !addr_ptr; d++)
+                {
+                    const WCHAR *p = iface_detail->DevicePath;
+                    while ((p = wcsstr( p, delims[d] )) != NULL)
+                    {
+                        p++;
+                        /* Check if this looks like a 12-char hex address */
+                        WCHAR path_addr[32] = {0};
+                        lstrcpynW( path_addr, p, 13 );
+                        if (wcslen( path_addr ) >= 12)
+                        {
+                            if (_wcsicmp( path_addr, addr_str ) == 0 || _wcsicmp( path_addr, addr_str_swapped ) == 0)
+                            {
+                                addr_ptr = p;
+                                break;
+                            }
+                        }
+                    }
+                }
                 if (addr_ptr)
                 {
-                    addr_ptr++;
                     WCHAR path_addr[32] = {0};
                     lstrcpynW( path_addr, addr_ptr, 13 );
                     if (retry == 0)
                         TRACE( " Comparing path address '%s' with search addresses '%s' or '%s' ===\n", debugstr_w( path_addr ), debugstr_w( addr_str ), debugstr_w( addr_str_swapped ) );
-                    if (_wcsicmp( path_addr, addr_str ) == 0 || _wcsicmp( path_addr, addr_str_swapped ) == 0)
+                    TRACE( " Address match found (retry %d)! Opening device interface ===\n", retry );
+                    device = CreateFileW( iface_detail->DevicePath, GENERIC_READ | GENERIC_WRITE,
+                                          FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL );
+                    if (device != INVALID_HANDLE_VALUE)
                     {
-                        TRACE( " Address match found (retry %d)! Opening device interface ===\n", retry );
-                        device = CreateFileW( iface_detail->DevicePath, GENERIC_READ | GENERIC_WRITE,
-                                              FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL );
-                        if (device != INVALID_HANDLE_VALUE)
-                        {
-                            TRACE( " Successfully opened device handle: %p ===\n", device );
-                            SetupDiDestroyDeviceInfoList( devinfo );
-                            return device;
-                        }
-                        else
-                        {
-                            TRACE( " CreateFileW failed: %lu ===\n", GetLastError() );
-                        }
+                        TRACE( " Successfully opened device handle: %p ===\n", device );
+                        SetupDiDestroyDeviceInfoList( devinfo );
+                        return device;
+                    }
+                    else
+                    {
+                        TRACE( " CreateFileW failed: %lu ===\n", GetLastError() );
                     }
                 }
             }
@@ -5698,12 +5999,13 @@ static HRESULT bluetooth_le_device_create( HSTRING id, UINT64 address, IBluetoot
         wcscpy( device_name, L"" );
     wcscpy( impl->name, device_name );
 
-    impl->device_handle = open_le_device_interface( address );
-    if (impl->device_handle == INVALID_HANDLE_VALUE)
-        WARN( "Failed to open device interface for address %I64x\n", address );
+    /* BLE devices use radio-based architecture - all operations go through the radio device
+     * with the device address as a parameter. Individual device interfaces are not needed.
+     * This matches the Linux (BlueZ/dbus.c) implementation. */
+    impl->device_handle = INVALID_HANDLE_VALUE;
 
     *out = &impl->IBluetoothLEDevice_iface;
-    TRACE( " Created BluetoothLEDevice %p, name=%s, address=%I64x, handle=%p ===\n", impl, debugstr_w( device_name ), address, impl->device_handle );
+    TRACE( " Created BluetoothLEDevice %p, name=%s, address=%I64x (radio-based architecture) ===\n", impl, debugstr_w( device_name ), address );
     return S_OK;
 }
 
@@ -6111,7 +6413,7 @@ static HRESULT WINAPI bluetoothledevice_statics2_GetDeviceSelectorFromAppearance
                                                                                    HSTRING *result )
 {
     FIXME( "(%p, %p, %p) stub!\n", iface, appearance, result );
-    return E_NOTIMPL;
+    ERR("!!! E_NOTIMPL - CRASHING!\n"); abort(); return E_NOTIMPL;
 }
 
 static HRESULT WINAPI bluetoothledevice_statics2_FromBluetoothAddressWithBluetoothAddressTypeAsync(

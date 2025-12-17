@@ -35,6 +35,12 @@
 /* Initiate the authentication procedure with a remote device. */
 #define IOCTL_WINEBTH_RADIO_START_AUTH         CTL_CODE(FILE_DEVICE_BLUETOOTH, 0xaa, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_WINEBTH_RADIO_REMOVE_DEVICE      CTL_CODE(FILE_DEVICE_BLUETOOTH, 0xab, METHOD_BUFFERED, FILE_ANY_ACCESS)
+/* Get GATT services for an LE device by address (via radio device) */
+#define IOCTL_WINEBTH_RADIO_GET_LE_DEVICE_GATT_SERVICES CTL_CODE(FILE_DEVICE_BLUETOOTH, 0xac, METHOD_BUFFERED, FILE_ANY_ACCESS)
+/* Get connection status for an LE device by address (via radio device) */
+#define IOCTL_WINEBTH_RADIO_GET_DEVICE_CONNECTION_STATUS CTL_CODE(FILE_DEVICE_BLUETOOTH, 0xad, METHOD_BUFFERED, FILE_ANY_ACCESS)
+/* Get GATT characteristics for a service by device address (via radio device) */
+#define IOCTL_WINEBTH_RADIO_GET_LE_DEVICE_GATT_CHARACTERISTICS CTL_CODE(FILE_DEVICE_BLUETOOTH, 0xae, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 /* Get all primary GATT services for the LE device. */
 #define IOCTL_WINEBTH_LE_DEVICE_GET_GATT_SERVICES CTL_CODE(FILE_DEVICE_BLUETOOTH, 0xc0, METHOD_BUFFERED, FILE_ANY_ACCESS)
@@ -94,6 +100,27 @@ struct winebth_le_device_get_gatt_services_params
 {
     ULONG count;
     BTH_LE_GATT_SERVICE services[0];
+};
+
+struct winebth_radio_get_le_device_gatt_services_params
+{
+    BTH_ADDR address;
+    ULONG count;
+    BTH_LE_GATT_SERVICE services[0];
+};
+
+struct winebth_radio_get_device_connection_status_params
+{
+    BTH_ADDR address;
+    BOOL connected;
+};
+
+struct winebth_radio_get_le_device_gatt_characteristics_params
+{
+    BTH_ADDR address;
+    BTH_LE_GATT_SERVICE service;
+    ULONG count;
+    BTH_LE_GATT_CHARACTERISTIC characteristics[0];
 };
 
 struct winebth_le_device_get_gatt_characteristics_params

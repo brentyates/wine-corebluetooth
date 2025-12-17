@@ -1159,6 +1159,8 @@ send_device_added:
             props_changed->device.handle = entry->handle;
             pthread_mutex_unlock(&self.ctx->peripheral_mutex);
 
+            NSLog(@"Wine: didConnectPeripheral QUEUING DEVICE_PROPS_CHANGED event connected=1 address=%llx",
+                  (unsigned long long)props_changed->props.address.ullLong);
             corebth_queue_event(self.ctx, &props_event);
         } else {
             pthread_mutex_unlock(&self.ctx->peripheral_mutex);
@@ -1173,6 +1175,9 @@ send_device_added:
     struct corebth_peripheral_entry *entry;
     struct corebth_watcher_event props_event;
     struct corebth_device_props_changed_event *props_changed = &props_event.data.device_props_changed;
+
+    NSLog(@"Wine: didDisconnectPeripheral CALLED peripheral=%@ name=%@ ERROR=%@",
+          [peripheral.identifier UUIDString], peripheral.name, error);
 
     if (self.ctx) {
         pthread_mutex_lock(&self.ctx->peripheral_mutex);
@@ -1214,10 +1219,21 @@ send_device_added:
 
 @implementation WinePeripheralDelegate
 
+- (void)dealloc
+{
+    NSLog(@"Wine: WinePeripheralDelegate DEALLOC ctx=%p periph=%p", self.ctx, self.periph);
+}
+
 - (void)peripheral:(CBPeripheral *)peripheral didDiscoverServices:(NSError *)error
 {
+    NSLog(@"Wine: didDiscoverServices CALLED peripheral=%@ error=%@ services=%lu",
+          [peripheral.identifier UUIDString], error, (unsigned long)[peripheral.services count]);
+
     if (!self.ctx || !self.periph)
+    {
+        NSLog(@"Wine: didDiscoverServices: ctx or periph is NULL! ctx=%p periph=%p", self.ctx, self.periph);
         return;
+    }
 
     NSUInteger count = [peripheral.services count];
     struct corebth_service_entry **new_entries = NULL;
@@ -1261,13 +1277,17 @@ send_device_added:
         NSUInteger service_count = [peripheral.services count];
         self.periph->pending_char_discovery_count = (int)service_count;
 
+        NSLog(@"Wine: === STARTING CHARACTERISTIC DISCOVERY for %lu services ===", (unsigned long)service_count);
         if (service_count == 0) {
+            NSLog(@"Wine: No services, marking discovery complete");
             self.periph->services_discovery_complete = 1;
             dispatch_semaphore_signal(self.periph->services_discovered);
         } else {
             for (CBService *service in peripheral.services) {
+                NSLog(@"Wine: Calling discoverCharacteristics for service %@", service.UUID);
                 [peripheral discoverCharacteristics:nil forService:service];
             }
+            NSLog(@"Wine: === Called discoverCharacteristics for all %lu services ===", (unsigned long)service_count);
         }
     }
 
@@ -1277,33 +1297,43 @@ done:
 
 - (void)peripheral:(CBPeripheral *)peripheral didDiscoverCharacteristicsForService:(CBService *)service error:(NSError *)error
 {
+    NSLog(@"Wine: === didDiscoverCharacteristicsForService CALLED service=%@ error=%@ chars=%lu ===",
+          service.UUID, error, (unsigned long)[service.characteristics count]);
+
     if (!self.ctx || !self.periph)
+    {
+        NSLog(@"Wine: ERROR - ctx or periph is NULL!");
         return;
+    }
 
     pthread_mutex_lock(&self.ctx->gatt_mutex);
     struct corebth_service_entry *svc = corebth_find_service_by_cb(self.ctx, service);
-    if (!svc)
+    if (svc)
     {
-        pthread_mutex_unlock(&self.ctx->gatt_mutex);
-        return;
-    }
-
-    for (CBCharacteristic *characteristic in service.characteristics)
-    {
-        struct corebth_char_entry *ch = corebth_find_char_by_cb(self.ctx, characteristic);
-        if (!ch)
+        for (CBCharacteristic *characteristic in service.characteristics)
         {
-            ch = corebth_add_char(self.ctx, svc, characteristic);
-            if (ch)
-                corebth_queue_char_added(self.ctx, ch);
+            struct corebth_char_entry *ch = corebth_find_char_by_cb(self.ctx, characteristic);
+            if (!ch)
+            {
+                ch = corebth_add_char(self.ctx, svc, characteristic);
+                if (ch)
+                    corebth_queue_char_added(self.ctx, ch);
+            }
         }
+    }
+    else
+    {
+        NSLog(@"Wine: didDiscoverCharacteristicsForService: service %@ not found in our list (ignoring chars)", service.UUID);
     }
     pthread_mutex_unlock(&self.ctx->gatt_mutex);
 
+    /* Always decrement count, even if service wasn't in our list */
     if (self.periph) {
         int remaining = __sync_sub_and_fetch(&self.periph->pending_char_discovery_count, 1);
+        NSLog(@"Wine: didDiscoverCharacteristicsForService: remaining=%d", remaining);
         if (remaining == 0) {
             self.periph->services_discovery_complete = 1;
+            NSLog(@"Wine: All characteristics discovered - signaling semaphore");
             dispatch_semaphore_signal(self.periph->services_discovered);
         }
     }
@@ -1708,7 +1738,11 @@ corebth_status corebth_device_start_pairing( void *connection, void *watcher_ctx
         if (peripheral_state == CBPeripheralStateConnected)
         {
             NSLog(@"Wine: corebth_device_start_pairing: already connected, calling discoverServices");
+            NSLog(@"Wine: corebth_device_start_pairing: BEFORE discoverServices - peripheral=%@ delegate=%@",
+                  peripheral_to_connect, peripheral_to_connect.delegate);
             [peripheral_to_connect discoverServices:nil];
+            NSLog(@"Wine: corebth_device_start_pairing: AFTER discoverServices - delegate still=%@",
+                  peripheral_to_connect.delegate);
         }
         else
         {
@@ -1718,6 +1752,16 @@ corebth_status corebth_device_start_pairing( void *connection, void *watcher_ctx
     }
 
     pthread_mutex_unlock(&ctx->peripheral_mutex);
+
+    /* Wait for service discovery to complete (max 10 seconds) */
+    NSLog(@"Wine: corebth_device_start_pairing: WAITING for services_discovered semaphore...");
+    dispatch_time_t timeout = dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC);
+    long result = dispatch_semaphore_wait(services_sem, timeout);
+    if (result == 0) {
+        NSLog(@"Wine: corebth_device_start_pairing: services_discovered signaled - SUCCESS");
+    } else {
+        NSLog(@"Wine: corebth_device_start_pairing: services_discovered TIMEOUT after 10s");
+    }
 
     return COREBTH_SUCCESS;
 }
