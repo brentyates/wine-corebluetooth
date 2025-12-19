@@ -341,6 +341,9 @@ struct corebth_char_entry
     struct corebth_notification_entry *notification_queue_head;
     struct corebth_notification_entry *notification_queue_tail;
     int ref_count;
+    unsigned char *cached_value;
+    unsigned int cached_value_len;
+    BOOL cached_value_valid;
 };
 
 struct corebth_context
@@ -788,6 +791,7 @@ static void corebth_free_char(struct corebth_char_entry *ch)
         free(n);
         n = next;
     }
+    free(ch->cached_value);
     free(ch);
 }
 
@@ -1407,6 +1411,21 @@ done:
             }
         }
     }
+    else if (!error)
+    {
+        NSData *data = characteristic.value;
+        if (data && data.length > 0) {
+            NSLog(@"Wine: didUpdateValueForCharacteristic: CACHING value len=%lu for char=%@",
+                  (unsigned long)data.length, characteristic.UUID);
+            free(ch->cached_value);
+            ch->cached_value = malloc((unsigned int)data.length);
+            if (ch->cached_value) {
+                memcpy(ch->cached_value, data.bytes, data.length);
+                ch->cached_value_len = (unsigned int)data.length;
+                ch->cached_value_valid = TRUE;
+            }
+        }
+    }
     pthread_mutex_unlock(&self.ctx->gatt_mutex);
 }
 
@@ -1857,6 +1876,16 @@ corebth_status corebth_characteristic_read( void *connection, const char *char_p
         return COREBTH_DEVICE_NOT_READY;
     }
 
+    if (ch->cached_value_valid && ch->cached_value && ch->cached_value_len > 0) {
+        unsigned int to_copy = MIN(buffer_size, ch->cached_value_len);
+        NSLog(@"Wine: corebth_characteristic_read: USING CACHED VALUE len=%u (requested=%u)", ch->cached_value_len, buffer_size);
+        memcpy(buffer, ch->cached_value, to_copy);
+        *len = to_copy;
+        ch->cached_value_valid = FALSE;
+        pthread_mutex_unlock(&ctx->gatt_mutex);
+        return COREBTH_SUCCESS;
+    }
+
     ch->pending_read_buffer = buffer;
     ch->pending_read_size = buffer_size;
     ch->pending_read_len = len;
@@ -1878,11 +1907,11 @@ corebth_status corebth_characteristic_read( void *connection, const char *char_p
             NSLog(@"Wine: corebth_characteristic_read: ERROR - bt_queue is NULL!");
             return COREBTH_INTERNAL_ERROR;
         }
-        dispatch_async(ctx->bt_queue, ^{
-            NSLog(@"Wine: corebth_characteristic_read: BLOCK STARTED on bt_queue");
+        dispatch_sync(ctx->bt_queue, ^{
+            NSLog(@"Wine: corebth_characteristic_read: BLOCK STARTED on bt_queue (sync)");
             @try {
                 [peripheral readValueForCharacteristic:characteristic];
-                NSLog(@"Wine: corebth_characteristic_read: readValueForCharacteristic dispatched successfully");
+                NSLog(@"Wine: corebth_characteristic_read: readValueForCharacteristic called successfully");
             }
             @catch (NSException *exception) {
                 NSLog(@"Wine: corebth_characteristic_read EXCEPTION in dispatch: %@", exception);
@@ -1894,7 +1923,7 @@ corebth_status corebth_characteristic_read( void *connection, const char *char_p
                 dispatch_semaphore_signal(sem);
             }
         });
-        NSLog(@"Wine: corebth_characteristic_read: dispatch_async returned (waiting for callback)");
+        NSLog(@"Wine: corebth_characteristic_read: dispatch_sync returned (waiting for callback)");
     }
 
     NSLog(@"Wine: corebth_characteristic_read: waiting on semaphore (5s timeout)");
