@@ -357,6 +357,13 @@ static NTSTATUS bluetooth_gatt_characteristic_free( void *args )
     return STATUS_SUCCESS;
 }
 
+static NTSTATUS bluetooth_gatt_characteristic_dup( void *args )
+{
+    struct bluetooth_gatt_characteristic_dup_params *params = args;
+    unix_name_dup( params->characteristic );
+    return STATUS_SUCCESS;
+}
+
 static NTSTATUS bluetooth_gatt_characteristic_read( void *args )
 {
     struct bluetooth_gatt_characteristic_read_params *params = args;
@@ -452,6 +459,7 @@ const unixlib_entry_t __wine_unix_call_funcs[] = {
     bluetooth_gatt_service_free,
 
     bluetooth_gatt_characteristic_free,
+    bluetooth_gatt_characteristic_dup,
     bluetooth_gatt_characteristic_read,
     bluetooth_gatt_characteristic_write,
     bluetooth_gatt_characteristic_set_notify,

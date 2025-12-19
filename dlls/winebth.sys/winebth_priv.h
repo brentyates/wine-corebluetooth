@@ -256,6 +256,7 @@ static inline BOOL winebluetooth_gatt_service_equal( winebluetooth_gatt_service_
 }
 
 void winebluetooth_gatt_characteristic_free( winebluetooth_gatt_characteristic_t characteristic );
+void winebluetooth_gatt_characteristic_dup( winebluetooth_gatt_characteristic_t characteristic );
 NTSTATUS winebluetooth_gatt_characteristic_read( winebluetooth_gatt_characteristic_t characteristic,
                                                   unsigned char *buffer, unsigned int buffer_size,
                                                   unsigned int *data_len );

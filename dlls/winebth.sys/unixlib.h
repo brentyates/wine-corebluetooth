@@ -74,6 +74,11 @@ struct bluetooth_gatt_characteristic_free_params
     unix_name_t characteristic;
 };
 
+struct bluetooth_gatt_characteristic_dup_params
+{
+    unix_name_t characteristic;
+};
+
 struct bluetooth_gatt_characteristic_read_params
 {
     unix_name_t characteristic;
@@ -185,6 +190,7 @@ enum bluetoothapis_funcs
     unix_bluetooth_gatt_service_free,
 
     unix_bluetooth_gatt_characteristic_free,
+    unix_bluetooth_gatt_characteristic_dup,
     unix_bluetooth_gatt_characteristic_read,
     unix_bluetooth_gatt_characteristic_write,
     unix_bluetooth_gatt_characteristic_set_notify,

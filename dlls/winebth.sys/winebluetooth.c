@@ -225,6 +225,16 @@ void winebluetooth_gatt_characteristic_free( winebluetooth_gatt_characteristic_t
     UNIX_BLUETOOTH_CALL( bluetooth_gatt_characteristic_free, &args );
 }
 
+void winebluetooth_gatt_characteristic_dup( winebluetooth_gatt_characteristic_t characteristic )
+{
+    struct bluetooth_gatt_characteristic_dup_params args = {0};
+
+    TRACE( "(%p)\n", (void *)characteristic.handle );
+
+    args.characteristic = characteristic.handle;
+    UNIX_BLUETOOTH_CALL( bluetooth_gatt_characteristic_dup, &args );
+}
+
 NTSTATUS winebluetooth_gatt_characteristic_read( winebluetooth_gatt_characteristic_t characteristic,
                                                   unsigned char *buffer, unsigned int buffer_size,
                                                   unsigned int *data_len )

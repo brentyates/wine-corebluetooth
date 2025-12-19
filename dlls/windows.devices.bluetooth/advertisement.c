@@ -215,7 +215,7 @@ static void process_pending_events( struct adv_watcher *watcher )
 {
     struct pending_event *ev;
 
-    while ((ev = watcher->event_head))
+    while (watcher && watcher->running && (ev = watcher->event_head))
     {
         watcher->event_head = ev->next;
         if (!watcher->event_head)
@@ -1072,8 +1072,10 @@ static DWORD WINAPI adv_watcher_event_thread( void *param )
         buffer = NULL;
 
 sleep_and_continue:
-        process_pending_events( watcher );
-        Sleep( 100 );
+        if (watcher->running)
+            process_pending_events( watcher );
+        if (watcher->running)
+            Sleep( 100 );
     }
 
     if (buffer) free( buffer );
@@ -1122,9 +1124,19 @@ static ULONG WINAPI adv_watcher_Release( IBluetoothLEAdvertisementWatcher *iface
     TRACE( "(%p) -> %lu\n", iface, ref );
     if (!ref)
     {
+        BOOL was_running = FALSE;
+        EnterCriticalSection( &impl->cs );
         if (impl->running)
         {
             impl->running = FALSE;
+            impl->event_head = NULL;
+            impl->event_tail = NULL;
+            was_running = TRUE;
+        }
+        LeaveCriticalSection( &impl->cs );
+        
+        if (was_running)
+        {
             if (impl->event_thread)
             {
                 WaitForSingleObject( impl->event_thread, 5000 );
@@ -1147,7 +1159,12 @@ static ULONG WINAPI adv_watcher_Release( IBluetoothLEAdvertisementWatcher *iface
             free( impl->event_head );
             impl->event_head = next;
         }
+        impl->event_tail = NULL;
+        if (impl->cs.DebugInfo && impl->cs.DebugInfo != (RTL_CRITICAL_SECTION_DEBUG *)-1)
+            impl->cs.DebugInfo->Spare[0] = 0;
         DeleteCriticalSection( &impl->cs );
+        impl->IBluetoothLEAdvertisementWatcher_iface.lpVtbl = NULL;
+        impl->IBluetoothLEAdvertisementWatcher2_iface.lpVtbl = NULL;
         free( impl );
     }
     return ref;

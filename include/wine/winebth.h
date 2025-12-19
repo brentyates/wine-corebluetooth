@@ -41,6 +41,14 @@
 #define IOCTL_WINEBTH_RADIO_GET_DEVICE_CONNECTION_STATUS CTL_CODE(FILE_DEVICE_BLUETOOTH, 0xad, METHOD_BUFFERED, FILE_ANY_ACCESS)
 /* Get GATT characteristics for a service by device address (via radio device) */
 #define IOCTL_WINEBTH_RADIO_GET_LE_DEVICE_GATT_CHARACTERISTICS CTL_CODE(FILE_DEVICE_BLUETOOTH, 0xae, METHOD_BUFFERED, FILE_ANY_ACCESS)
+/* Read pending notifications for a characteristic by device address (via radio device) */
+#define IOCTL_WINEBTH_RADIO_READ_NOTIFICATION CTL_CODE(FILE_DEVICE_BLUETOOTH, 0xaf, METHOD_BUFFERED, FILE_ANY_ACCESS)
+/* Read a characteristic value by device address (via radio device) */
+#define IOCTL_WINEBTH_RADIO_READ_CHARACTERISTIC CTL_CODE(FILE_DEVICE_BLUETOOTH, 0xb0, METHOD_BUFFERED, FILE_ANY_ACCESS)
+/* Write a characteristic value by device address (via radio device) */
+#define IOCTL_WINEBTH_RADIO_WRITE_CHARACTERISTIC CTL_CODE(FILE_DEVICE_BLUETOOTH, 0xb1, METHOD_BUFFERED, FILE_ANY_ACCESS)
+/* Enable/disable notifications for a characteristic by device address (via radio device) */
+#define IOCTL_WINEBTH_RADIO_SET_NOTIFY CTL_CODE(FILE_DEVICE_BLUETOOTH, 0xb2, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 /* Get all primary GATT services for the LE device. */
 #define IOCTL_WINEBTH_LE_DEVICE_GET_GATT_SERVICES CTL_CODE(FILE_DEVICE_BLUETOOTH, 0xc0, METHOD_BUFFERED, FILE_ANY_ACCESS)
@@ -123,6 +131,15 @@ struct winebth_radio_get_le_device_gatt_characteristics_params
     BTH_LE_GATT_CHARACTERISTIC characteristics[0];
 };
 
+struct winebth_radio_read_notification_params
+{
+    BTH_ADDR address;
+    BTH_LE_GATT_SERVICE service;
+    BTH_LE_GATT_CHARACTERISTIC characteristic;
+    ULONG data_size;
+    UCHAR data[0];
+};
+
 struct winebth_le_device_get_gatt_characteristics_params
 {
     BTH_LE_GATT_SERVICE service;
@@ -160,6 +177,33 @@ struct winebth_le_device_read_notification_params
     BTH_LE_GATT_CHARACTERISTIC characteristic;
     ULONG data_size;
     UCHAR data[0];
+};
+
+struct winebth_radio_read_characteristic_params
+{
+    BTH_ADDR address;
+    BTH_LE_GATT_SERVICE service;
+    BTH_LE_GATT_CHARACTERISTIC characteristic;
+    ULONG data_size;
+    UCHAR data[0];
+};
+
+struct winebth_radio_write_characteristic_params
+{
+    BTH_ADDR address;
+    BTH_LE_GATT_SERVICE service;
+    BTH_LE_GATT_CHARACTERISTIC characteristic;
+    ULONG write_type;
+    ULONG data_size;
+    UCHAR data[0];
+};
+
+struct winebth_radio_set_notify_params
+{
+    BTH_ADDR address;
+    BTH_LE_GATT_SERVICE service;
+    BTH_LE_GATT_CHARACTERISTIC characteristic;
+    BOOL enable;
 };
 
 #pragma pack(pop)
