@@ -1434,6 +1434,7 @@ done:
 
     pthread_mutex_lock(&self.ctx->service_list_mutex);
     struct corebth_char_entry *ch = corebth_find_char_by_cb(self.ctx, characteristic);
+    if (ch) corebth_char_retain(ch);
     pthread_mutex_unlock(&self.ctx->service_list_mutex);
 
     if (!ch) {
@@ -1442,6 +1443,7 @@ done:
     }
     if (char_is_invalidated(ch)) {
         NSLog(@"Wine: didUpdateValueForCharacteristic: char invalidated, ignoring");
+        corebth_char_release(ch);
         return;
     }
 
@@ -1455,6 +1457,7 @@ done:
         if (!data) {
             char_set_read_status(ch, COREBTH_INTERNAL_ERROR);
             dispatch_semaphore_signal(ch->pending_read);
+            corebth_char_release(ch);
             return;
         }
         unsigned int to_copy = MIN(ch->pending_read_size, (unsigned int)data.length);
@@ -1508,6 +1511,7 @@ done:
             }
         }
     }
+    corebth_char_release(ch);
 }
 
 - (void)peripheral:(CBPeripheral *)peripheral didWriteValueForCharacteristic:(CBCharacteristic *)characteristic error:(NSError *)error
@@ -1517,10 +1521,14 @@ done:
 
     pthread_mutex_lock(&self.ctx->service_list_mutex);
     struct corebth_char_entry *ch = corebth_find_char_by_cb(self.ctx, characteristic);
+    if (ch) corebth_char_retain(ch);
     pthread_mutex_unlock(&self.ctx->service_list_mutex);
 
     if (!ch) return;
-    if (char_is_invalidated(ch)) return;
+    if (char_is_invalidated(ch)) {
+        corebth_char_release(ch);
+        return;
+    }
 
     if (char_get_write_status(ch) == COREBTH_PENDING)
     {
@@ -1536,6 +1544,7 @@ done:
         }
         dispatch_semaphore_signal(ch->pending_write);
     }
+    corebth_char_release(ch);
 }
 
 - (void)peripheral:(CBPeripheral *)peripheral didUpdateNotificationStateForCharacteristic:(CBCharacteristic *)characteristic error:(NSError *)error
@@ -1544,10 +1553,14 @@ done:
 
     pthread_mutex_lock(&self.ctx->service_list_mutex);
     struct corebth_char_entry *ch = corebth_find_char_by_cb(self.ctx, characteristic);
+    if (ch) corebth_char_retain(ch);
     pthread_mutex_unlock(&self.ctx->service_list_mutex);
 
     if (!ch) return;
-    if (char_is_invalidated(ch)) return;
+    if (char_is_invalidated(ch)) {
+        corebth_char_release(ch);
+        return;
+    }
 
     if (char_get_write_status(ch) == COREBTH_PENDING)
     {
@@ -1563,6 +1576,7 @@ done:
         }
         dispatch_semaphore_signal(ch->pending_write);
     }
+    corebth_char_release(ch);
 }
 
 @end
@@ -2062,6 +2076,7 @@ corebth_status corebth_characteristic_write( void *connection, const char *char_
     CBCharacteristicWriteType cb_type = (write_type == 0) ? CBCharacteristicWriteWithResponse
                                                           : CBCharacteristicWriteWithoutResponse;
     CBPeripheral *peripheral;
+    CBCharacteristic *characteristic;
     NSUInteger max_write_len;
     long wait_result;
     corebth_status status;
@@ -2073,10 +2088,13 @@ corebth_status corebth_characteristic_write( void *connection, const char *char_
 
     pthread_mutex_lock(&ctx->service_list_mutex);
     ch = corebth_find_char_by_path(ctx, char_path);
-    if (!ch) {
+    if (!ch || !ch->service || !ch->service->peripheral || !ch->service->peripheral->peripheral) {
         pthread_mutex_unlock(&ctx->service_list_mutex);
         return COREBTH_NOT_SUPPORTED;
     }
+
+    peripheral = ch->service->peripheral->peripheral;
+    characteristic = ch->characteristic;
 
     char_set_write_status(ch, COREBTH_PENDING);
     sem = ch->pending_write;
@@ -2086,7 +2104,6 @@ corebth_status corebth_characteristic_write( void *connection, const char *char_
 
     @autoreleasepool {
         NSData *data = [NSData dataWithBytes:value length:len];
-        peripheral = ch->service->peripheral->peripheral;
 
         if (!peripheral.delegate) {
             char_set_write_status(ch, COREBTH_INTERNAL_ERROR);
@@ -2108,8 +2125,8 @@ corebth_status corebth_characteristic_write( void *connection, const char *char_
             corebth_char_release(ch);
             return COREBTH_INVALID_PARAMETER;
         }
-        if ((ch->characteristic.properties & CBCharacteristicPropertyWrite) == 0 &&
-            (ch->characteristic.properties & CBCharacteristicPropertyWriteWithoutResponse) == 0) {
+        if ((characteristic.properties & CBCharacteristicPropertyWrite) == 0 &&
+            (characteristic.properties & CBCharacteristicPropertyWriteWithoutResponse) == 0) {
             char_set_write_status(ch, COREBTH_INVALID_PARAMETER);
             dispatch_semaphore_signal(sem);
             corebth_char_release(ch);
@@ -2118,7 +2135,7 @@ corebth_status corebth_characteristic_write( void *connection, const char *char_
 
         /* IMPORTANT: CoreBluetooth requires peripheral methods to be called from the same queue
          * that the CBCentralManager was created with. Dispatch to bt_queue. */
-        CBCharacteristic *char_to_write = ch->characteristic;
+        CBCharacteristic *char_to_write = characteristic;
         dispatch_async(ctx->bt_queue, ^{
             @try {
                 [peripheral writeValue:data
@@ -2161,15 +2178,21 @@ corebth_status corebth_characteristic_set_notify( void *connection, const char *
 {
     struct corebth_context *ctx = connection;
     struct corebth_char_entry *ch;
+    CBPeripheral *peripheral;
+    CBCharacteristic *characteristic;
 
     if (!ctx) return COREBTH_NOT_SUPPORTED;
 
     pthread_mutex_lock(&ctx->service_list_mutex);
     ch = corebth_find_char_by_path(ctx, char_path);
-    if (!ch) {
+    if (!ch || !ch->service || !ch->service->peripheral || !ch->service->peripheral->peripheral) {
         pthread_mutex_unlock(&ctx->service_list_mutex);
         return COREBTH_NOT_SUPPORTED;
     }
+
+    peripheral = ch->service->peripheral->peripheral;
+    characteristic = ch->characteristic;
+
     ch->notifications_enabled = enable ? TRUE : FALSE;
     corebth_char_retain(ch);
     pthread_mutex_unlock(&ctx->service_list_mutex);
@@ -2177,8 +2200,6 @@ corebth_status corebth_characteristic_set_notify( void *connection, const char *
     /* IMPORTANT: CoreBluetooth requires peripheral methods to be called from the same queue
      * that the CBCentralManager was created with. Dispatch to bt_queue. */
     @autoreleasepool {
-        CBPeripheral *peripheral = ch->service->peripheral->peripheral;
-        CBCharacteristic *characteristic = ch->characteristic;
         BOOL enable_val = enable ? YES : NO;
         dispatch_async(ctx->bt_queue, ^{
             [peripheral setNotifyValue:enable_val forCharacteristic:characteristic];
