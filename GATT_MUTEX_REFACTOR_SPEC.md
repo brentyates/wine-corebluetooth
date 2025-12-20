@@ -15,6 +15,10 @@ This document specifies the complete refactoring of the `winebth.sys` synchroniz
 5. [Call Site Transformations](#5-call-site-transformations)
 6. [Implementation Order](#6-implementation-order)
 7. [Verification Checklist](#7-verification-checklist)
+8. [Appendix A: Complete List of Functions to Modify](#appendix-a-complete-list-of-functions-to-modify)
+9. [Appendix B: Regression Risk Assessment](#appendix-b-regression-risk-assessment)
+10. [Appendix C: Debug Helpers](#appendix-c-debug-helpers)
+11. [Appendix D: CoreBluetooth (macOS) Considerations](#appendix-d-corebluetooth-macos-considerations)
 
 ---
 
@@ -1862,6 +1866,192 @@ static void validate_lock_order( const char *func, int line )
 #define ENTER_DEVICE_LIST_CS() EnterCriticalSection(&device_list_cs)
 #endif
 ```
+
+---
+
+## Appendix D: CoreBluetooth (macOS) Considerations
+
+**NOTE:** This specification was developed against the Linux/BlueZ (`dbus.c`) implementation. The CoreBluetooth implementation on a separate branch may require additional considerations documented here.
+
+### D.1 Scope Clarification
+
+| Component | Shared | CoreBluetooth-Specific |
+|-----------|--------|------------------------|
+| `winebth.c` (Windows driver) | ✓ All lock hierarchy, refcounting, state machine | Same code |
+| `dbus.c` (Linux backend) | N/A | Not used on macOS |
+| `corebluetooth.m` (macOS backend) | N/A | **Needs separate review** |
+| Event loop integration | ✓ Pattern applies | Delegate callbacks instead of DBus signals |
+
+### D.2 CoreBluetooth Threading Model Differences
+
+**BlueZ/DBus (Linux):**
+- Synchronous or predictable message loop
+- Single DBus connection thread
+- Events delivered via `dbus_connection_read_write_dispatch`
+
+**CoreBluetooth (macOS):**
+- Fully asynchronous, delegate-based
+- Callbacks arrive on dispatch queues (GCD)
+- `CBCentralManagerDelegate`, `CBPeripheralDelegate` methods
+- macOS can invalidate objects externally
+
+### D.3 Additional State: BLUETOOTH_STATE_INVALIDATED
+
+CoreBluetooth can disconnect a device or invalidate a service at the OS level before the driver knows. Add a fourth state:
+
+```c
+enum bluetooth_object_state
+{
+    BLUETOOTH_STATE_INITIALIZING,  // Being created, not yet in list
+    BLUETOOTH_STATE_ACTIVE,        // In list, fully operational
+    BLUETOOTH_STATE_REMOVING,      // Marked for removal, draining refs
+    BLUETOOTH_STATE_INVALIDATED,   // macOS invalidated underlying object
+};
+```
+
+**Use case:** When `centralManager:didDisconnectPeripheral:` fires, the `CBPeripheral` is no longer usable. Set state to `INVALIDATED` immediately. The Windows-side refcount keeps memory safe, but all operations should return `STATUS_DEVICE_NOT_CONNECTED`.
+
+### D.4 Deadlock Prevention with Delegate Callbacks
+
+**The Classic CoreBluetooth Deadlock:**
+```
+Thread A (IOCTL):     Holds device_list_cs → calls [peripheral discoverServices]
+Thread B (Delegate):  didDiscoverServices fires → tries to acquire device_list_cs
+→ DEADLOCK
+```
+
+**Rule:** NEVER hold `device_list_cs` when calling any CoreBluetooth method:
+- `[centralManager connectPeripheral:]`
+- `[peripheral discoverServices:]`
+- `[peripheral discoverCharacteristics:forService:]`
+- `[peripheral readValueForCharacteristic:]`
+- `[peripheral writeValue:forCharacteristic:]`
+
+**Pattern:**
+```objc
+// WRONG:
+EnterCriticalSection(&device_list_cs);
+device = find_device(...);
+[device->peripheral discoverServices:nil];  // BAD!
+LeaveCriticalSection(&device_list_cs);
+
+// CORRECT:
+EnterCriticalSection(&device_list_cs);
+device = find_device(...);
+bluetooth_device_incref(device);
+CBPeripheral *peripheral = device->peripheral;  // Copy pointer
+LeaveCriticalSection(&device_list_cs);
+
+[peripheral discoverServices:nil];  // OK - no lock held
+// Completion will come via delegate callback
+```
+
+### D.5 Service Discovery and Immutability
+
+The `chars_cs` removal strategy is **even more critical** for CoreBluetooth because characteristic discovery is asynchronous.
+
+**Lifecycle:**
+1. `didDiscoverPeripheral:` → Create `bluetooth_remote_device` with `state = INITIALIZING`
+2. `didConnectPeripheral:` → Start service discovery
+3. `didDiscoverServices:` → Create `bluetooth_gatt_service` entries (still `INITIALIZING`)
+4. `didDiscoverCharacteristicsForService:` → Add characteristics to service
+5. **Only after all characteristics discovered** → Set service `state = ACTIVE`
+
+**Key insight:** A service in `INITIALIZING` state should NOT be visible to Windows IOCTLs. The characteristic list is only immutable once the service transitions to `ACTIVE`.
+
+### D.6 Object Mapping: CBPeripheral ↔ bluetooth_remote_device
+
+CoreBluetooth objects need stable mapping back to Wine objects:
+
+```c
+struct bluetooth_remote_device
+{
+    // ... existing fields ...
+
+    // CoreBluetooth-specific
+    void *cb_peripheral;           // (__bridge void *)CBPeripheral
+    NSUUID *peripheral_identifier; // Stable identifier across connections
+};
+```
+
+**Note:** `CBPeripheral` pointers can change between connections. Use `peripheral.identifier` (NSUUID) for stable identification.
+
+### D.7 Async IRP Completion with Delegates
+
+Many IOCTLs become asynchronous with CoreBluetooth:
+
+| IOCTL | BlueZ | CoreBluetooth |
+|-------|-------|---------------|
+| Connect | Sync DBus call | `connectPeripheral:` + `didConnectPeripheral:` delegate |
+| Discover Services | Sync DBus call | `discoverServices:` + `didDiscoverServices:` delegate |
+| Read Characteristic | Sync DBus call | `readValueForCharacteristic:` + `didUpdateValueForCharacteristic:` |
+
+**Pattern for async IOCTL:**
+```c
+// In IOCTL handler:
+EnterCriticalSection(&device_list_cs);
+IoSetCancelRoutine(irp, bluetooth_irp_cancel_routine);
+IoMarkIrpPending(irp);
+InsertTailList(&radio->irp_list, &irp->Tail.Overlay.ListEntry);
+// Store context to map delegate callback back to IRP
+device->pending_read_irp = irp;
+device->pending_read_char = characteristic;
+LeaveCriticalSection(&device_list_cs);
+
+// Call CoreBluetooth (no lock held)
+[peripheral readValueForCharacteristic:cbCharacteristic];
+return STATUS_PENDING;
+
+// In delegate callback (didUpdateValueForCharacteristic:):
+EnterCriticalSection(&device_list_cs);
+device = find_device_by_peripheral(peripheral);
+if (device && device->pending_read_irp)
+{
+    IRP *irp = device->pending_read_irp;
+    device->pending_read_irp = NULL;
+
+    if (IoSetCancelRoutine(irp, NULL) != NULL)
+    {
+        RemoveEntryList(&irp->Tail.Overlay.ListEntry);
+        LeaveCriticalSection(&device_list_cs);
+
+        // Copy data to IRP buffer
+        irp->IoStatus.Status = STATUS_SUCCESS;
+        IoCompleteRequest(irp, IO_NO_INCREMENT);
+        return;
+    }
+}
+LeaveCriticalSection(&device_list_cs);
+```
+
+### D.8 GCD Queue Safety
+
+CoreBluetooth delegate methods are called on dispatch queues. Ensure:
+
+1. **Never block the delegate queue** - Use async patterns
+2. **Don't hold `device_list_cs` across queue boundaries**
+3. **Consider using a dedicated serial queue** for all CoreBluetooth operations to simplify synchronization
+
+```objc
+// Create a serial queue for CoreBluetooth
+dispatch_queue_t bt_queue = dispatch_queue_create("org.winehq.bluetooth", DISPATCH_QUEUE_SERIAL);
+
+// Initialize CBCentralManager on this queue
+centralManager = [[CBCentralManager alloc] initWithDelegate:self queue:bt_queue];
+```
+
+### D.9 CoreBluetooth Review Checklist
+
+When the CoreBluetooth code is available, verify:
+
+- [ ] All CoreBluetooth method calls happen outside `device_list_cs`
+- [ ] `INVALIDATED` state is set on `didDisconnectPeripheral:`
+- [ ] Services only become `ACTIVE` after characteristic discovery completes
+- [ ] `CBPeripheral` mapping uses stable `identifier`, not pointer
+- [ ] Async IOCTLs properly use `irp_list` with cancel routine
+- [ ] Delegate callbacks check for cancelled IRPs before completing
+- [ ] GCD queue is serial to avoid internal races
+- [ ] No `@synchronized` blocks that could conflict with `device_list_cs`
 
 ---
 
