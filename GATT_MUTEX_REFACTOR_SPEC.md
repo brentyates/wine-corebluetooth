@@ -2040,18 +2040,271 @@ dispatch_queue_t bt_queue = dispatch_queue_create("org.winehq.bluetooth", DISPAT
 centralManager = [[CBCentralManager alloc] initWithDelegate:self queue:bt_queue];
 ```
 
-### D.9 CoreBluetooth Review Checklist
+### D.9 Additional Considerations (Beyond Gemini's Analysis)
+
+These are potential issues not covered in the initial CoreBluetooth analysis:
+
+#### D.9.1 INVALIDATED vs REMOVING - Are They Different?
+
+**Question:** Is `BLUETOOTH_STATE_INVALIDATED` actually distinct from `REMOVING`, or is it a sub-case?
+
+| Scenario | Who Initiates | What Happens |
+|----------|---------------|--------------|
+| Windows PnP removal | Windows | ACTIVE → REMOVING → freed |
+| macOS disconnect | macOS | ACTIVE → INVALIDATED → ? |
+| App termination | Wine | Both paths simultaneously? |
+
+**Concern:** If a device is `INVALIDATED` by macOS, does Windows PnP eventually send `IRP_MN_REMOVE_DEVICE`? If so, the state machine is:
+```
+ACTIVE → INVALIDATED → REMOVING → freed
+```
+
+But if Windows PnP doesn't know about the invalidation, we have orphaned objects. Need to understand:
+- Does CoreBluetooth invalidation trigger Wine to call `IoInvalidateDeviceRelations`?
+- Or do we need to proactively notify PnP?
+
+**Proposal:** `INVALIDATED` might be better modeled as a flag rather than a state:
+```c
+struct bluetooth_remote_device {
+    enum bluetooth_object_state state;  // INITIALIZING, ACTIVE, REMOVING
+    BOOL macos_invalidated;             // macOS object no longer usable
+};
+```
+
+#### D.9.2 Multiple Pending IRPs Per Device
+
+**Problem:** The async pattern in D.7 stores a single `pending_read_irp` per device. But what if:
+- App issues read on characteristic A
+- Before callback fires, app issues read on characteristic B
+- Which IRP does the callback complete?
+
+**Solution options:**
+1. **Per-characteristic IRP tracking:** Each characteristic has its own pending IRP
+2. **IRP queue with context:** Queue of (IRP, characteristic, operation_type) tuples
+3. **Serialize operations:** Only allow one outstanding operation per device
+
+**Recommendation:** Option 2 (queue with context) is most flexible:
+```c
+struct pending_operation {
+    struct list entry;
+    IRP *irp;
+    enum { OP_READ, OP_WRITE, OP_DISCOVER } type;
+    void *context;  // CBCharacteristic, CBService, etc.
+};
+
+struct bluetooth_remote_device {
+    // ...
+    struct list pending_operations;  // Guarded by device_list_cs
+};
+```
+
+#### D.9.3 Nested Delegate Callbacks
+
+**Question:** Can CoreBluetooth delegates trigger synchronously within each other?
+
+Example:
+```objc
+- (void)peripheral:(CBPeripheral *)peripheral didDiscoverServices:(NSError *)error {
+    for (CBService *service in peripheral.services) {
+        [peripheral discoverCharacteristics:nil forService:service];
+        // Does didDiscoverCharacteristicsForService fire HERE before we return?
+    }
+}
+```
+
+**If yes:** We might acquire `device_list_cs` in the outer callback, call CoreBluetooth, and the inner callback tries to acquire again → **deadlock** (CRITICAL_SECTION is recursive, but still risky if patterns assume single-entry).
+
+**If no:** GCD serial queue ensures callbacks are sequential, not nested.
+
+**Need to verify:** CoreBluetooth documentation on callback sequencing.
+
+#### D.9.4 CBPeripheral/CBService/CBCharacteristic Lifetime
+
+**Question:** When macOS invalidates a `CBPeripheral`, are its `CBService` and `CBCharacteristic` objects also invalid?
+
+**If yes:** We must cascade invalidation:
+```
+didDisconnectPeripheral →
+  invalidate bluetooth_remote_device →
+    invalidate all bluetooth_gatt_service →
+      invalidate all bluetooth_gatt_characteristic
+```
+
+**If no:** Services/characteristics might be reusable on reconnect (unlikely but need to verify).
+
+#### D.9.5 ARC Bridging Across C/Objective-C Boundary
+
+**Problem:** CoreBluetooth objects are ARC-managed. Wine driver code is C (no ARC).
+
+**Patterns needed:**
+```objc
+// Storing ObjC object in C struct (take ownership)
+device->cb_peripheral = (__bridge_retained void *)peripheral;
+
+// Getting ObjC object from C struct (borrow, no ownership change)
+CBPeripheral *peripheral = (__bridge CBPeripheral *)device->cb_peripheral;
+
+// Releasing when C struct is freed
+CFRelease(device->cb_peripheral);  // Balance the __bridge_retained
+```
+
+**Risk:** Memory leaks if `__bridge_retained` not balanced by `CFRelease`.
+**Risk:** Use-after-free if using `__bridge` when object is already deallocated.
+
+#### D.9.6 Error Propagation: NSError → NTSTATUS
+
+**Need a mapping table:**
+```c
+static NTSTATUS corebluetooth_error_to_ntstatus(NSError *error) {
+    if (!error) return STATUS_SUCCESS;
+
+    if ([error.domain isEqualToString:CBErrorDomain]) {
+        switch (error.code) {
+            case CBErrorConnectionTimeout:
+                return STATUS_IO_TIMEOUT;
+            case CBErrorPeripheralDisconnected:
+                return STATUS_DEVICE_NOT_CONNECTED;
+            case CBErrorConnectionFailed:
+                return STATUS_CONNECTION_REFUSED;
+            // ... etc
+        }
+    }
+    return STATUS_UNSUCCESSFUL;
+}
+```
+
+#### D.9.7 Reconnection Semantics
+
+**Scenario:** Device disconnects, then reconnects.
+
+**Questions:**
+1. Does `didDiscoverPeripheral` fire again with the same `peripheral.identifier`?
+2. Do we reuse the existing `bluetooth_remote_device` or create a new one?
+3. If reusing, do we need to re-discover services, or are they cached?
+
+**Windows expectation:** Device removal and re-addition are separate PnP events. Same Bluetooth address = same device to the app.
+
+**Proposal:** On reconnect with same UUID:
+1. Find existing `bluetooth_remote_device` by `peripheral_identifier`
+2. If found and `state == INVALIDATED`, transition to `ACTIVE`
+3. Update `cb_peripheral` pointer (it may have changed)
+4. Re-discover services (don't trust cache)
+
+#### D.9.8 Timeout Handling for Async Operations
+
+**Problem:** What if a CoreBluetooth operation never completes?
+
+**Examples:**
+- `connectPeripheral:` - device never responds
+- `discoverServices:` - BLE connection drops silently
+- `readValueForCharacteristic:` - peripheral doesn't respond
+
+**Current IRP model:** IRPs wait indefinitely until cancelled.
+
+**Options:**
+1. **Rely on Windows app timeout:** App will cancel the IRP eventually
+2. **Driver-side timeout:** Use `KeSetTimer` to cancel after N seconds
+3. **CoreBluetooth timeout:** Use `dispatch_after` to check completion
+
+**Recommendation:** Option 1 (app timeout) is simplest. Add Option 3 as defensive measure:
+```objc
+dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC), bt_queue, ^{
+    if (device->pending_connect_irp) {
+        // Connection didn't complete in 30s - treat as failed
+        complete_irp(device->pending_connect_irp, STATUS_IO_TIMEOUT);
+    }
+});
+```
+
+#### D.9.9 Thread Safety of CBPeripheral Property Access
+
+**Question:** Is it safe to read `peripheral.services` or `peripheral.name` from the Wine event thread while CoreBluetooth delegate is firing on GCD queue?
+
+**If no:** All property access must happen on the GCD queue:
+```objc
+dispatch_sync(bt_queue, ^{
+    NSString *name = peripheral.name;
+    // Copy to C buffer
+});
+```
+
+**Concern:** `dispatch_sync` from Wine thread to GCD queue while holding `device_list_cs` could deadlock if delegate callback is waiting for `device_list_cs`.
+
+**Safe pattern:**
+```c
+// Release lock before dispatch_sync
+LeaveCriticalSection(&device_list_cs);
+dispatch_sync(bt_queue, ^{ ... });
+EnterCriticalSection(&device_list_cs);
+// Re-validate state after re-acquiring lock
+```
+
+#### D.9.10 Services Without Characteristics
+
+**Edge case:** A GATT service with zero characteristics.
+
+**Question:** Does `didDiscoverCharacteristicsForService:` fire with an empty array, or not at all?
+
+**If not at all:** We never transition service to `ACTIVE` and it's never visible to Windows.
+
+**Fix:** After `didDiscoverServices`, check `service.characteristics.count == 0` and immediately mark those services `ACTIVE`.
+
+### D.10 CoreBluetooth Review Checklist
 
 When the CoreBluetooth code is available, verify:
 
+**Lock Safety:**
 - [ ] All CoreBluetooth method calls happen outside `device_list_cs`
-- [ ] `INVALIDATED` state is set on `didDisconnectPeripheral:`
-- [ ] Services only become `ACTIVE` after characteristic discovery completes
-- [ ] `CBPeripheral` mapping uses stable `identifier`, not pointer
-- [ ] Async IOCTLs properly use `irp_list` with cancel routine
-- [ ] Delegate callbacks check for cancelled IRPs before completing
+- [ ] No `dispatch_sync` to GCD queue while holding `device_list_cs`
 - [ ] GCD queue is serial to avoid internal races
 - [ ] No `@synchronized` blocks that could conflict with `device_list_cs`
+- [ ] Delegate callbacks don't assume they can re-enter (nested callbacks)
+
+**State Management:**
+- [ ] `INVALIDATED` state (or flag) is set on `didDisconnectPeripheral:`
+- [ ] Invalidation cascades to services and characteristics
+- [ ] Services only become `ACTIVE` after characteristic discovery completes
+- [ ] Services with zero characteristics are handled correctly
+- [ ] Reconnection reuses existing objects or properly cleans up old ones
+
+**Object Mapping:**
+- [ ] `CBPeripheral` mapping uses stable `identifier` (NSUUID), not pointer
+- [ ] `CBService` and `CBCharacteristic` have stable mapping strategy
+- [ ] ARC bridging is correct (`__bridge_retained` balanced by `CFRelease`)
+- [ ] No memory leaks when objects are invalidated
+
+**IRP Handling:**
+- [ ] Async IOCTLs properly use `irp_list` with cancel routine
+- [ ] Delegate callbacks check for cancelled IRPs before completing
+- [ ] Multiple pending IRPs per device are tracked correctly (not just single pending_irp)
+- [ ] Operation timeout handling exists (or documented as app responsibility)
+
+**Error Handling:**
+- [ ] NSError → NTSTATUS mapping exists for all CBError codes
+- [ ] Partial failures (some services discovered, some failed) are handled
+- [ ] Connection failures clean up any partially-created objects
+
+**Thread Safety:**
+- [ ] CBPeripheral property access happens on correct thread/queue
+- [ ] No race between reading properties and delegate updates
+
+---
+
+### D.11 Open Questions to Resolve with Actual Code
+
+These questions can only be answered by examining the actual implementation:
+
+1. **How is the event loop integrated?** Does CoreBluetooth have its own thread, or does it use Wine's event loop?
+
+2. **Where does state live?** Is there a single global `CBCentralManager`, or one per radio?
+
+3. **How are handles mapped?** What's the correspondence between Windows BTH_LE_* handles and CoreBluetooth objects?
+
+4. **Is pairing separate?** CoreBluetooth handles pairing at the OS level - how does this interact with the Windows pairing APIs?
+
+5. **What about scanning?** `CBCentralManager.scanForPeripherals` is very different from Windows radio discovery. How is this abstracted?
+
+6. **Notifications/Indications?** CoreBluetooth uses `setNotifyValue:forCharacteristic:` - how does this map to Windows GATT notification model?
 
 ---
 
