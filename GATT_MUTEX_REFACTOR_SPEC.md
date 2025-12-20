@@ -118,6 +118,95 @@ IoReportTargetDeviceChange(...);  // GOOD: no lock held
 bluetooth_device_decref(device);  // Release reference
 ```
 
+### 2.6 IRP Cancellation and irp_list Synchronization
+
+**Current Gap:** The existing code queues IRPs to `radio->irp_list` (line 546) without setting a cancel routine via `IoSetCancelRoutine`. This means:
+- If an IRP is cancelled by the system, no callback fires
+- The cancelled IRP remains on `irp_list`
+- When `remove_pending_irps` runs, it may complete an already-cancelled IRP (double-complete = BSOD)
+
+**Required Implementation:**
+
+```c
+/* Cancel routine for pending pairing IRPs */
+static void WINAPI bluetooth_irp_cancel_routine( DEVICE_OBJECT *device, IRP *irp )
+{
+    struct bluetooth_radio *radio = /* extract from device extension */;
+
+    /* Release the cancel spinlock first (required by Windows) */
+    IoReleaseCancelSpinLock( irp->CancelIrql );
+
+    /* Now acquire our lock to safely remove from list */
+    EnterCriticalSection( &device_list_cs );
+    RemoveEntryList( &irp->Tail.Overlay.ListEntry );
+    LeaveCriticalSection( &device_list_cs );
+
+    irp->IoStatus.Status = STATUS_CANCELLED;
+    irp->IoStatus.Information = 0;
+    IoCompleteRequest( irp, IO_NO_INCREMENT );
+}
+```
+
+**When queuing an IRP (modified line 545-547):**
+
+```c
+if (status == STATUS_PENDING)
+{
+    EnterCriticalSection( &device_list_cs );
+
+    /* Set cancel routine BEFORE adding to list */
+    IoSetCancelRoutine( irp, bluetooth_irp_cancel_routine );
+
+    /* Check if already cancelled (race with IoSetCancelRoutine) */
+    if (irp->Cancel && IoSetCancelRoutine( irp, NULL ))
+    {
+        /* IRP was cancelled before we set the routine - don't queue */
+        LeaveCriticalSection( &device_list_cs );
+        irp->IoStatus.Status = STATUS_CANCELLED;
+        irp->IoStatus.Information = 0;
+        IoCompleteRequest( irp, IO_NO_INCREMENT );
+        return STATUS_CANCELLED;
+    }
+
+    IoMarkIrpPending( irp );
+    InsertTailList( &ext->irp_list, &irp->Tail.Overlay.ListEntry );
+    LeaveCriticalSection( &device_list_cs );
+}
+```
+
+**When removing pending IRPs (modified remove_pending_irps):**
+
+```c
+static void remove_pending_irps( struct bluetooth_radio *radio )
+{
+    LIST_ENTRY *entry;
+    IRP *irp;
+
+    /* Caller must hold device_list_cs */
+    while ((entry = RemoveHeadList( &radio->irp_list )) != &radio->irp_list)
+    {
+        irp = CONTAINING_RECORD( entry, IRP, Tail.Overlay.ListEntry );
+
+        /* Clear cancel routine - if it returns NULL, cancel routine is running */
+        if (IoSetCancelRoutine( irp, NULL ) == NULL)
+        {
+            /* Cancel routine will complete this IRP - skip it */
+            continue;
+        }
+
+        irp->IoStatus.Status = STATUS_DELETE_PENDING;
+        irp->IoStatus.Information = 0;
+        IoCompleteRequest( irp, IO_NO_INCREMENT );
+    }
+}
+```
+
+**Key Synchronization Rules:**
+1. `device_list_cs` guards all `irp_list` operations
+2. Cancel routine acquires `device_list_cs` after releasing cancel spinlock
+3. Always check `IoSetCancelRoutine` return value to detect racing cancellation
+4. Never complete an IRP if its cancel routine is already running
+
 ---
 
 ## 3. Struct Modifications
@@ -1639,11 +1728,14 @@ Verify state transitions are valid:
 
 | Change | Risk Level | Mitigation |
 |--------|------------|------------|
-| Remove `chars_cs` | Medium | Characteristics are immutable after discovery; verify with tests |
-| Add refcounting | Low | Standard pattern; just ensure balance |
-| Move external calls | Medium | Must preserve exact behavior; test thoroughly |
-| Change state from bool to enum | Low | Mechanical transformation |
-| Fix IOCTL lock ordering | Medium | Ensure no deadlock introduced; stress test |
+| Convert `started`/`removed` to enum | Low | Mechanical transformation; compile-time errors catch missed spots |
+| Remove `chars_cs` | Medium | Ensure no hidden write operations exist for characteristics after init. Audit all `LIST_FOR_EACH_ENTRY` on characteristics to confirm read-only. |
+| Add refcounting | Medium-High | A single leaked `incref` = memory leak. A missed `incref` = BSOD. Every code path must be audited for balance. |
+| Move external calls | Medium | Must preserve exact behavior; external calls may have side effects that depend on timing |
+| Fix IOCTL lock ordering | Medium | Ensure no deadlock introduced; stress test with concurrent IOCTLs |
+| Add IRP cancel routine | Medium | Standard pattern but easy to get wrong. Test with forced IRP cancellation. |
+
+**Critical Success Factor:** Reference count balance. Use debug helpers (Appendix C) to log all incref/decref pairs during development.
 
 ---
 
