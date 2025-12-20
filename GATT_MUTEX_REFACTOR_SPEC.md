@@ -207,6 +207,47 @@ static void remove_pending_irps( struct bluetooth_radio *radio )
 3. Always check `IoSetCancelRoutine` return value to detect racing cancellation
 4. Never complete an IRP if its cancel routine is already running
 
+**Fix complete_irp (line 1119):**
+
+The existing `complete_irp` function is called when pairing finishes (line 1387) but doesn't handle the cancellation race. If the IRP is cancelled at the same moment pairing completes, both the cancel routine and `complete_irp` will try to complete it → BSOD.
+
+```c
+/* Complete a pending IRP from the pairing list.
+ * Returns TRUE if we completed it, FALSE if cancel routine will. */
+static BOOL complete_irp( IRP *irp, NTSTATUS result )
+{
+    KIRQL irql;
+
+    EnterCriticalSection( &device_list_cs );
+
+    /* Clear the cancel routine atomically.
+     * If it returns NULL, the cancel routine is already running. */
+    if (IoSetCancelRoutine( irp, NULL ) == NULL)
+    {
+        /* Cancel routine owns this IRP now - don't touch it */
+        LeaveCriticalSection( &device_list_cs );
+        return FALSE;
+    }
+
+    RemoveEntryList( &irp->Tail.Overlay.ListEntry );
+    LeaveCriticalSection( &device_list_cs );
+
+    irp->IoStatus.Status = result;
+    irp->IoStatus.Information = 0;
+    IoCompleteRequest( irp, IO_NO_INCREMENT );
+    return TRUE;
+}
+```
+
+**Update caller (line 1387):**
+```c
+case BLUETOOTH_WATCHER_EVENT_TYPE_PAIRING_FINISHED:
+    /* complete_irp returns FALSE if cancel routine already handled it */
+    complete_irp( event->event_data.pairing_finished.irp,
+                  event->event_data.pairing_finished.result );
+    break;
+```
+
 ---
 
 ## 3. Struct Modifications
@@ -1547,6 +1588,68 @@ case IOCTL_WINEBTH_LE_DEVICE_GET_GATT_SERVICES:
 
 ---
 
+### 5.17 Pattern: PnP Device Removal with Refcount Draining
+
+**Problem:** With refcounting, `IRP_MN_REMOVE_DEVICE` can arrive while in-flight IOCTLs still hold references to the device. We must wait for these to drain before destroying.
+
+**Current flow (lines 1682-1700):**
+```c
+case IRP_MN_SURPRISE_REMOVAL:
+    ext->removed = TRUE;
+    list_remove( &ext->entry );  // Prevents new refs
+    break;
+
+case IRP_MN_REMOVE_DEVICE:
+    assert( ext->removed );
+    remote_device_destroy( ext );  // BUG: might have outstanding refs
+    break;
+```
+
+**AFTER:**
+```c
+case IRP_MN_SURPRISE_REMOVAL:
+{
+    EnterCriticalSection( &device_list_cs );
+    if (ext->state == BLUETOOTH_STATE_ACTIVE)
+    {
+        ext->state = BLUETOOTH_STATE_REMOVING;
+        list_remove( &ext->entry );
+    }
+    LeaveCriticalSection( &device_list_cs );
+    ret = STATUS_SUCCESS;
+    break;
+}
+
+case IRP_MN_REMOVE_DEVICE:
+{
+    /* Wait for all references to drain.
+     * After SURPRISE_REMOVAL, state is REMOVING and device is off the list,
+     * so no new references can be acquired. In-flight operations will
+     * decref when they complete. */
+    if (ext->refcount > 1)
+    {
+        LARGE_INTEGER timeout;
+        timeout.QuadPart = -10000;  /* 1ms */
+        while (InterlockedCompareExchange( &ext->refcount, 0, 0 ) > 1)
+            KeDelayExecutionThread( KernelMode, FALSE, &timeout );
+    }
+
+    remote_device_destroy( ext );
+
+    ext->props_cs.DebugInfo->Spare[0] = 0;
+    DeleteCriticalSection( &ext->props_cs );
+
+    irp->IoStatus.Status = STATUS_SUCCESS;
+    IoCompleteRequest( irp, IO_NO_INCREMENT );
+    IoDeleteDevice( device_obj );
+    return STATUS_SUCCESS;
+}
+```
+
+**Same pattern applies to `radio_pdo_pnp` (lines 1783-1841).**
+
+---
+
 ## 6. Implementation Order
 
 Execute these steps in order. Each step should compile and run before proceeding to the next.
@@ -1719,8 +1822,9 @@ Verify state transitions are valid:
 | `bluetooth_radio_set_properties` | 1576 | Already correct |
 | `remove_pending_irps` | 1606 | Already correct |
 | `remote_device_destroy` | 1620 | Remove chars_cs deletion |
-| `remote_device_pdo_pnp` | 1641 | Use state, fix external calls in START_DEVICE |
-| `radio_pdo_pnp` | 1714 | Use state |
+| `complete_irp` | 1119 | Add IoSetCancelRoutine check for cancellation race |
+| `remote_device_pdo_pnp` | 1641 | Use state, fix external calls in START_DEVICE, add refcount drain in REMOVE_DEVICE |
+| `radio_pdo_pnp` | 1714 | Use state, add refcount drain in REMOVE_DEVICE |
 
 ---
 
