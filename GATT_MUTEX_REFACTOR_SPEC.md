@@ -1594,6 +1594,8 @@ case IOCTL_WINEBTH_LE_DEVICE_GET_GATT_SERVICES:
 
 ### 5.17 Pattern: PnP Device Removal with Refcount Draining
 
+> **⚠️ CoreBluetooth Note:** The busy-wait pattern below is suitable for Linux/BlueZ but can cause deadlocks on macOS. For CoreBluetooth, use the **Async Destruction** pattern in Section D.12.2 instead.
+
 **Problem:** With refcounting, `IRP_MN_REMOVE_DEVICE` can arrive while in-flight IOCTLs still hold references to the device. We must wait for these to drain before destroying.
 
 **Current flow (lines 1682-1700):**
@@ -2305,6 +2307,347 @@ These questions can only be answered by examining the actual implementation:
 5. **What about scanning?** `CBCentralManager.scanForPeripherals` is very different from Windows radio discovery. How is this abstracted?
 
 6. **Notifications/Indications?** CoreBluetooth uses `setNotifyValue:forCharacteristic:` - how does this map to Windows GATT notification model?
+
+---
+
+### D.12 Critical Refinements (Gemini Review #2)
+
+These refinements address specific feedback from the second Gemini review and are **critical** for CoreBluetooth correctness.
+
+#### D.12.1 The State Check TOCTOU Race - CBPeripheral as Volatile Resource
+
+**Original approach:** Use `InterlockedCompareExchange(&obj->state, 0, 0)` for atomic state reads.
+
+**Problem:** In the macOS delegate model, state can change immediately after the check (user toggles Bluetooth off in macOS menu bar, device moves out of range, etc.).
+
+**Refinement:** Treat the `CBPeripheral` pointer itself as a volatile resource. The `macos_invalidated` flag (from D.9.1) must be checked **before** touching any Objective-C pointers:
+
+```c
+static NTSTATUS device_operation_with_peripheral(struct bluetooth_remote_device *device)
+{
+    CBPeripheral *peripheral;
+
+    EnterCriticalSection(&device_list_cs);
+
+    /* Check invalidation FIRST - before even reading the ObjC pointer */
+    if (device->macos_invalidated)
+    {
+        LeaveCriticalSection(&device_list_cs);
+        return STATUS_DEVICE_NOT_CONNECTED;
+    }
+
+    /* State check second */
+    if (device->state != BLUETOOTH_STATE_ACTIVE)
+    {
+        LeaveCriticalSection(&device_list_cs);
+        return STATUS_DEVICE_NOT_CONNECTED;
+    }
+
+    /* Now safe to read the pointer */
+    peripheral = (__bridge CBPeripheral *)device->cb_peripheral;
+    bluetooth_device_incref(device);
+    LeaveCriticalSection(&device_list_cs);
+
+    /* Perform CoreBluetooth operation outside lock */
+    [peripheral discoverServices:nil];
+
+    bluetooth_device_decref(device);
+    return STATUS_PENDING;
+}
+```
+
+**Delegate callback must set `macos_invalidated` immediately:**
+```objc
+- (void)centralManager:(CBCentralManager *)central
+    didDisconnectPeripheral:(CBPeripheral *)peripheral
+                      error:(NSError *)error
+{
+    EnterCriticalSection(&device_list_cs);
+    struct bluetooth_remote_device *device = find_device_by_peripheral(peripheral);
+    if (device)
+    {
+        /* Set IMMEDIATELY - before any other processing */
+        device->macos_invalidated = TRUE;
+
+        /* Cancel all pending operations for this device */
+        cancel_pending_operations(device, STATUS_DEVICE_NOT_CONNECTED);
+    }
+    LeaveCriticalSection(&device_list_cs);
+
+    /* Notify PnP of device removal */
+    // ... IoInvalidateDeviceRelations if needed ...
+}
+```
+
+#### D.12.2 Async Destruction Instead of Busy-Wait Draining
+
+**Original approach (Section 5.17):** Busy-wait with `KeDelayExecutionThread` until refcount drains.
+
+**Problem:** In macOS/Wine, if the thread holding the reference is waiting for a CoreBluetooth callback that is trying to acquire `device_list_cs`, the entire driver hangs.
+
+**Refinement:** Use **Asynchronous Destruction** - when refcount hits zero, `decref` itself triggers cleanup:
+
+```c
+static void bluetooth_device_decref(struct bluetooth_remote_device *device)
+{
+    LONG new_count = InterlockedDecrement(&device->refcount);
+
+    if (new_count == 0)
+    {
+        /* We are the last reference holder - trigger destruction.
+         *
+         * IMPORTANT: This means device is already off the list
+         * (state == REMOVING or INVALIDATED) and no new refs
+         * can be acquired.
+         */
+        bluetooth_device_async_destroy(device);
+    }
+}
+
+static void bluetooth_device_async_destroy(struct bluetooth_remote_device *device)
+{
+    /* Release Objective-C objects */
+    if (device->cb_peripheral)
+    {
+        CFRelease(device->cb_peripheral);
+        device->cb_peripheral = NULL;
+    }
+
+    /* Free Windows-side resources */
+    device->props_cs.DebugInfo->Spare[0] = 0;
+    DeleteCriticalSection(&device->props_cs);
+
+    /* Free the struct itself */
+    free(device);
+}
+```
+
+**Updated PnP removal (replaces Section 5.17 busy-wait):**
+
+```c
+case IRP_MN_SURPRISE_REMOVAL:
+{
+    EnterCriticalSection(&device_list_cs);
+    if (ext->state == BLUETOOTH_STATE_ACTIVE)
+    {
+        ext->state = BLUETOOTH_STATE_REMOVING;
+        list_remove(&ext->entry);
+
+        /* Mark macOS side invalid too */
+        ext->macos_invalidated = TRUE;
+    }
+    LeaveCriticalSection(&device_list_cs);
+
+    /* Drop our "list membership" reference.
+     * If refcount becomes 0, async_destroy runs.
+     * If not, the last decref will trigger it. */
+    bluetooth_device_decref(ext);
+
+    ret = STATUS_SUCCESS;
+    break;
+}
+
+case IRP_MN_REMOVE_DEVICE:
+{
+    /* Device should already be destroyed by async pattern.
+     * If not (e.g., refcount > 0), we must NOT wait - that causes deadlock.
+     *
+     * Instead, complete the PnP IRP and let async destruction
+     * handle cleanup when the last reference is released.
+     */
+    irp->IoStatus.Status = STATUS_SUCCESS;
+    IoCompleteRequest(irp, IO_NO_INCREMENT);
+    IoDeleteDevice(device_obj);
+    return STATUS_SUCCESS;
+}
+```
+
+**Key difference:** No waiting, no blocking. The device memory is freed when the last reference is released, which could be:
+- Immediately (if no in-flight operations)
+- Later (when in-flight operations complete)
+- From a CoreBluetooth delegate callback (when async operation finishes)
+
+#### D.12.3 dispatch_sync and device_list_cs: The AB-BA Deadlock
+
+**Rule (reinforced from D.8):** NEVER hold `device_list_cs` when calling `dispatch_sync` to the CoreBluetooth queue.
+
+**Why:** If a delegate callback is running on the GCD queue and waiting for `device_list_cs`, you get:
+
+```
+Thread A (IOCTL):
+  EnterCriticalSection(&device_list_cs)  ← Holds lock
+  dispatch_sync(bt_queue, ^{ ... })       ← Waits for queue
+
+Thread B (Delegate on bt_queue):
+  (running on bt_queue)
+  EnterCriticalSection(&device_list_cs)  ← Waits for lock
+```
+
+**→ Classic AB-BA deadlock.**
+
+**Safe patterns:**
+
+```c
+/* Pattern 1: Release lock before dispatch_sync, re-acquire after */
+EnterCriticalSection(&device_list_cs);
+device = find_device(...);
+if (device) {
+    bluetooth_device_incref(device);  /* Hold ref across dispatch */
+    LeaveCriticalSection(&device_list_cs);
+
+    dispatch_sync(bt_queue, ^{
+        /* Safe to access CoreBluetooth objects here */
+        NSString *name = [peripheral name];
+        // ...
+    });
+
+    EnterCriticalSection(&device_list_cs);
+    /* Re-validate state - device may have been invalidated while we dispatched */
+    if (device->macos_invalidated) {
+        LeaveCriticalSection(&device_list_cs);
+        bluetooth_device_decref(device);
+        return STATUS_DEVICE_NOT_CONNECTED;
+    }
+    LeaveCriticalSection(&device_list_cs);
+    bluetooth_device_decref(device);
+}
+
+/* Pattern 2: Use dispatch_async and pend the IRP */
+EnterCriticalSection(&device_list_cs);
+device = find_device(...);
+if (device) {
+    IoSetCancelRoutine(irp, cancel_routine);
+    IoMarkIrpPending(irp);
+    InsertTailList(&device->pending_ops, &irp_context->entry);
+    LeaveCriticalSection(&device_list_cs);
+
+    dispatch_async(bt_queue, ^{
+        /* This runs later, never blocks the IOCTL thread */
+        // ...
+    });
+
+    return STATUS_PENDING;
+}
+```
+
+#### D.12.4 The macos_context Wrapper Struct
+
+Gemini suggests bundling Objective-C pointers for safer management:
+
+```c
+struct macos_context {
+    void *peripheral_ptr;    /* (__bridge_retained void *)CBPeripheral */
+    void *central_ptr;       /* (__bridge_retained void *)CBCentralManager */
+    dispatch_queue_t queue;  /* The serial queue for this radio */
+};
+
+struct bluetooth_radio {
+    // ... existing fields ...
+    struct macos_context *macos;  /* NULL if not CoreBluetooth backend */
+};
+
+/* Cleanup helper */
+static void macos_context_release(struct macos_context *ctx)
+{
+    if (!ctx) return;
+
+    if (ctx->peripheral_ptr)
+        CFRelease(ctx->peripheral_ptr);
+    if (ctx->central_ptr)
+        CFRelease(ctx->central_ptr);
+    /* Note: dispatch_queue_t is ARC-managed in modern macOS,
+     * but if compiled with -fno-objc-arc, needs dispatch_release() */
+
+    free(ctx);
+}
+```
+
+**Benefits:**
+1. Single place to audit ARC bridging
+2. Clear ownership semantics
+3. Easy to check "is this a CoreBluetooth radio?" via `if (radio->macos)`
+
+#### D.12.5 Handle-to-Object Lookup Safety
+
+Gemini flags that mapping Windows GATT handles (16-bit integers) to `CBCharacteristic` objects is a common bug source.
+
+**Problem:** macOS may re-order characteristics during discovery. A handle that was valid for characteristic A might point to characteristic B after reconnection.
+
+**Safe approach:** Use composite keys instead of raw handles:
+
+```c
+struct gatt_handle_entry {
+    struct wine_rb_entry entry;
+
+    /* Composite key for lookup */
+    USHORT service_handle;         /* Parent service handle */
+    USHORT characteristic_handle;  /* Characteristic handle within service */
+
+    /* CoreBluetooth object (retained) */
+    void *cb_characteristic;       /* (__bridge_retained void *)CBCharacteristic */
+
+    /* Stable identity */
+    uuid_t uuid;                   /* Characteristic UUID for validation */
+};
+
+static struct rb_tree gatt_handles;
+static pthread_mutex_t gatt_handles_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Lookup with validation */
+static CBCharacteristic *lookup_characteristic(USHORT svc_handle, USHORT char_handle, uuid_t *expected_uuid)
+{
+    struct gatt_handle_entry *entry;
+
+    pthread_mutex_lock(&gatt_handles_lock);
+    entry = find_by_handles(svc_handle, char_handle);
+
+    if (!entry) {
+        pthread_mutex_unlock(&gatt_handles_lock);
+        return nil;
+    }
+
+    /* Validate UUID matches - catches re-ordering bugs */
+    if (expected_uuid && uuid_compare(entry->uuid, *expected_uuid) != 0) {
+        WARN("Handle %04x:%04x UUID mismatch - characteristic may have been reordered\n",
+             svc_handle, char_handle);
+        pthread_mutex_unlock(&gatt_handles_lock);
+        return nil;
+    }
+
+    CBCharacteristic *result = (__bridge CBCharacteristic *)entry->cb_characteristic;
+    pthread_mutex_unlock(&gatt_handles_lock);
+    return result;
+}
+```
+
+**On reconnect:** Invalidate all handles for the device and re-discover. Don't assume handles persist across connections.
+
+---
+
+### D.13 Updated Checklist (Post-Gemini Review #2)
+
+Add these verification items:
+
+**Async Destruction:**
+- [ ] `decref` triggers `async_destroy` when refcount hits zero
+- [ ] No `while (refcount > 0)` busy-wait loops anywhere
+- [ ] PnP REMOVE_DEVICE does NOT wait for refcount drain
+- [ ] Async destruction correctly releases ObjC objects via `CFRelease`
+
+**TOCTOU Safety:**
+- [ ] `macos_invalidated` flag checked BEFORE reading `cb_peripheral`
+- [ ] Delegate callbacks set `macos_invalidated = TRUE` FIRST in disconnect handler
+- [ ] All operations re-validate state after releasing and re-acquiring lock
+
+**dispatch_sync Safety:**
+- [ ] ZERO calls to `dispatch_sync` while holding `device_list_cs`
+- [ ] If `dispatch_sync` needed, lock is released first with refcount held
+- [ ] Prefer `dispatch_async` + IRP pending over `dispatch_sync`
+
+**Handle Mapping:**
+- [ ] Handles use composite key (service + characteristic)
+- [ ] UUID validation on handle lookup to catch re-ordering
+- [ ] All handles invalidated on device disconnect/reconnect
 
 ---
 
