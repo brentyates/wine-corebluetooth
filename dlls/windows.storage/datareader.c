@@ -117,7 +117,7 @@ static HRESULT WINAPI data_reader_get_UnconsumedBufferLength( IDataReader *iface
     if (!value) return E_POINTER;
     if (impl->position > impl->length) *value = 0;
     else *value = impl->length - impl->position;
-    ERR( "=== UnconsumedBufferLength: position=%u length=%u result=%u ===\n", impl->position, impl->length, *value );
+    TRACE( "iface %p, position=%u length=%u result=%u.\n", iface, impl->position, impl->length, *value );
     return S_OK;
 }
 
@@ -181,19 +181,13 @@ static HRESULT WINAPI data_reader_ReadByte( IDataReader *iface, BYTE *value )
 static HRESULT WINAPI data_reader_ReadBytes( IDataReader *iface, UINT32 length, BYTE *value )
 {
     struct data_reader *impl = impl_from_IDataReader( iface );
-    ERR( "=== ReadBytes: length=%u position=%u total_length=%u ===\n", length, impl->position, impl->length );
-    if (impl->position + length > impl->length) {
-        ERR( "=== ReadBytes: E_BOUNDS! position+length=%u > total=%u ===\n", impl->position + length, impl->length );
+    TRACE( "iface %p, length=%u position=%u total_length=%u.\n", iface, length, impl->position, impl->length );
+    if (impl->position + length > impl->length)
+    {
+        WARN( "E_BOUNDS: position(%u) + length(%u) > total(%u).\n", impl->position, length, impl->length );
         return E_BOUNDS;
     }
     memcpy(value, impl->data + impl->position, length);
-    if (length > 0 && length <= 64) {
-        ERR( "=== ReadBytes: first bytes: %02x %02x %02x %02x ===\n",
-             impl->data[impl->position],
-             length > 1 ? impl->data[impl->position+1] : 0,
-             length > 2 ? impl->data[impl->position+2] : 0,
-             length > 3 ? impl->data[impl->position+3] : 0 );
-    }
     impl->position += length;
     return S_OK;
 }
@@ -243,6 +237,7 @@ static HRESULT WINAPI data_reader_ReadInt32( IDataReader *iface, INT32 *value )
     struct data_reader *impl = impl_from_IDataReader( iface );
     UINT32 v;
     TRACE( "iface %p, value %p.\n", iface, value );
+    if (!value) return E_POINTER;
     if (impl->position + 4 > impl->length) return E_BOUNDS;
     
     memcpy(&v, impl->data + impl->position, 4);
@@ -739,7 +734,6 @@ static HRESULT WINAPI factory_FromBuffer( IDataReaderStatics *iface, IBuffer *bu
     struct data_reader *reader;
     IBufferByteAccess *byte_access;
     HRESULT hr;
-    UINT32 i;
 
     TRACE( "iface %p, buffer %p, data_reader %p.\n", iface, buffer, data_reader );
 
@@ -774,17 +768,7 @@ static HRESULT WINAPI factory_FromBuffer( IDataReaderStatics *iface, IBuffer *bu
     reader->buffer = buffer;
     IBuffer_get_Length(buffer, &reader->length);
 
-    ERR( "=== FromBuffer: length=%u data=%p ===\n", reader->length, reader->data );
-    if (reader->data && reader->length > 0)
-    {
-        char hex[256];
-        UINT32 max_dump = reader->length > 80 ? 80 : reader->length;
-        for (i = 0; i < max_dump && i * 3 < sizeof(hex) - 4; i++)
-            sprintf(hex + i * 3, "%02x ", reader->data[i]);
-        hex[max_dump * 3] = 0;
-        ERR( "=== FromBuffer HEX: %s ===\n", hex );
-        ERR( "=== FromBuffer ASCII: %.48s ===\n", reader->data );
-    }
+    TRACE( "iface %p, buffer %p, length=%u data=%p.\n", iface, buffer, reader->length, reader->data );
 
     *data_reader = &reader->IDataReader_iface;
     return S_OK;
