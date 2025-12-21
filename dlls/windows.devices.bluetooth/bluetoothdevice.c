@@ -1534,7 +1534,8 @@ static HRESULT WINAPI le_device_get_ConnectionStatus( IBluetoothLEDevice *iface,
     DWORD bytes_returned;
     BOOL connected = FALSE;
 
-    TRACE( "(%p, %p) device_handle=%p (INVALID=%p)\n", iface, value, impl->device_handle, INVALID_HANDLE_VALUE );
+    TRACE( "(%p, %p) device_handle=%p (%s)\n", iface, value, impl->device_handle,
+           impl->device_handle == INVALID_HANDLE_VALUE ? "INVALID" : "valid" );
 
     if (!value) return E_POINTER;
 
@@ -3003,15 +3004,13 @@ static DWORD WINAPI gatt_char_notification_thread( void *arg )
                         {
                             EnterCriticalSection( &impl->handler_cs );
                             handler = impl->value_changed_handler;
-                            if (handler) ITypedEventHandler_GattCharacteristic_GattValueChangedEventArgs_AddRef( handler );
-                            LeaveCriticalSection( &impl->handler_cs );
-
                             if (handler)
                             {
-                            ITypedEventHandler_GattCharacteristic_GattValueChangedEventArgs_Invoke( handler, &impl->IGattCharacteristic_iface, event_args );
-
-                            ITypedEventHandler_GattCharacteristic_GattValueChangedEventArgs_Release( handler );
+                                ITypedEventHandler_GattCharacteristic_GattValueChangedEventArgs_AddRef( handler );
+                                ITypedEventHandler_GattCharacteristic_GattValueChangedEventArgs_Invoke( handler, &impl->IGattCharacteristic_iface, event_args );
+                                ITypedEventHandler_GattCharacteristic_GattValueChangedEventArgs_Release( handler );
                             }
+                            LeaveCriticalSection( &impl->handler_cs );
                             IGattValueChangedEventArgs_Release( event_args );
                         }
                         IBuffer_Release( &gatt_buf->IBuffer_iface );
@@ -3284,11 +3283,11 @@ static HRESULT WINAPI gatt_chars_iterator_get_HasCurrent( IIterator_GattCharacte
 
 static HRESULT WINAPI gatt_chars_iterator_MoveNext( IIterator_GattCharacteristic *iface, boolean *value )
 {
-    HRESULT hr;
-    TRACE( "(%p, %p)\n", iface, value );
-    hr = gatt_chars_iterator_get_HasCurrent( iface, value );
-    
-    return hr;
+    struct gatt_chars_iterator *impl = impl_from_IIterator_GattCharacteristic( iface );
+    TRACE( "(%p, %p) index=%u size=%u\n", iface, value, impl->index, impl->size );
+    if (!value) return E_POINTER;
+    if (impl->index < impl->size) impl->index++;
+    return gatt_chars_iterator_get_HasCurrent( iface, value );
 }
 
 static HRESULT WINAPI gatt_chars_iterator_GetMany( IIterator_GattCharacteristic *iface, UINT32 items_size,

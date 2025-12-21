@@ -369,6 +369,11 @@ static NTSTATUS bluetooth_gatt_characteristic_read( void *args )
     struct bluetooth_gatt_characteristic_read_params *params = args;
 
     if (!dbus_connection) return STATUS_NOT_SUPPORTED;
+    if (!params->characteristic || !params->characteristic->str)
+    {
+        ERR("bluetooth_gatt_characteristic_read: characteristic is NULL!\n");
+        return STATUS_INVALID_PARAMETER;
+    }
 #ifdef __APPLE__
     return corebth_characteristic_read( dbus_connection, params->characteristic->str,
                                         params->buffer, params->buffer_size, params->data_len );
@@ -382,6 +387,11 @@ static NTSTATUS bluetooth_gatt_characteristic_write( void *args )
     struct bluetooth_gatt_characteristic_write_params *params = args;
 
     if (!dbus_connection) return STATUS_NOT_SUPPORTED;
+    if (!params->characteristic || !params->characteristic->str)
+    {
+        ERR("bluetooth_gatt_characteristic_write: characteristic is NULL!\n");
+        return STATUS_INVALID_PARAMETER;
+    }
 #ifdef __APPLE__
     return corebth_characteristic_write( dbus_connection, params->characteristic->str,
                                          params->data, params->size, params->write_type );
@@ -395,6 +405,11 @@ static NTSTATUS bluetooth_gatt_characteristic_set_notify( void *args )
     struct bluetooth_gatt_characteristic_set_notify_params *params = args;
 
     if (!dbus_connection) return STATUS_NOT_SUPPORTED;
+    if (!params->characteristic || !params->characteristic->str)
+    {
+        ERR("bluetooth_gatt_characteristic_set_notify: characteristic is NULL!\n");
+        return STATUS_INVALID_PARAMETER;
+    }
 #ifdef __APPLE__
     return corebth_characteristic_set_notify( dbus_connection, params->characteristic->str,
                                              params->enable );
@@ -408,6 +423,11 @@ static NTSTATUS bluetooth_gatt_characteristic_read_notification( void *args )
     struct bluetooth_gatt_characteristic_read_notification_params *params = args;
 
     if (!dbus_connection) return STATUS_NOT_SUPPORTED;
+    if (!params->characteristic || !params->characteristic->str)
+    {
+        ERR("bluetooth_gatt_characteristic_read_notification: characteristic is NULL!\n");
+        return STATUS_INVALID_PARAMETER;
+    }
 #ifdef __APPLE__
     {
         corebth_status ret;

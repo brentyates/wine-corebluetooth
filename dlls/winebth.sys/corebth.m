@@ -344,6 +344,10 @@ struct corebth_char_entry
     _Atomic BOOL invalidated;
     _Atomic unsigned int pending_read_actual_len;
     unsigned char pending_read_internal_buffer[COREBTH_MAX_CHAR_VALUE_SIZE];
+    uint32_t read_generation;
+    uint32_t read_completed_gen;
+    uint32_t write_generation;
+    uint32_t write_completed_gen;
     BOOL notifications_enabled;
     pthread_mutex_t notification_mutex;
     dispatch_semaphore_t notification_semaphore;
@@ -831,6 +835,7 @@ static void corebth_free_char(struct corebth_char_entry *ch)
         n = next;
     }
     free(ch->cached_value);
+    if (ch->characteristic) CFBridgingRelease(ch->characteristic);
     free(ch);
 }
 
@@ -858,7 +863,7 @@ static struct corebth_service_entry *corebth_create_service_entry(struct corebth
         return NULL;
 
     entry->peripheral = periph;
-    entry->service = service;
+    entry->service = (CBService *)CFBridgingRetain(service);
     entry->attr_handle = attr_handle;
     entry->is_primary = service.isPrimary;
     corebth_cbuuid_to_guid(service.UUID, &entry->uuid);
@@ -932,6 +937,7 @@ static void corebth_clear_peripheral_services(struct corebth_context *ctx, struc
         }
 
         if (svc->path) unix_name_free(svc->path);
+        if (svc->service) CFBridgingRelease(svc->service);
         free(svc);
     }
     periph->services = NULL;
@@ -988,7 +994,7 @@ static struct corebth_char_entry *corebth_add_char(struct corebth_context *ctx,
     if (!entry) return NULL;
 
     entry->service = svc;
-    entry->characteristic = characteristic;
+    entry->characteristic = (CBCharacteristic *)CFBridgingRetain(characteristic);
     entry->pending_read = dispatch_semaphore_create(0);
     entry->pending_write = dispatch_semaphore_create(0);
     char_set_read_status(entry, COREBTH_IDLE);
@@ -1434,44 +1440,47 @@ done:
 
     pthread_mutex_lock(&self.ctx->service_list_mutex);
     struct corebth_char_entry *ch = corebth_find_char_by_cb(self.ctx, characteristic);
-    if (ch) corebth_char_retain(ch);
-    pthread_mutex_unlock(&self.ctx->service_list_mutex);
-
     if (!ch) {
+        pthread_mutex_unlock(&self.ctx->service_list_mutex);
         NSLog(@"Wine: didUpdateValueForCharacteristic: char NOT FOUND");
         return;
     }
+    corebth_char_retain(ch);
+
     if (char_is_invalidated(ch)) {
+        pthread_mutex_unlock(&self.ctx->service_list_mutex);
         NSLog(@"Wine: didUpdateValueForCharacteristic: char invalidated, ignoring");
         corebth_char_release(ch);
         return;
     }
 
     corebth_status read_status = char_get_read_status(ch);
-    NSLog(@"Wine: didUpdateValueForCharacteristic: found char, pending_read_status=%d pending_read_buffer=%p notifications_enabled=%d",
-          read_status, ch->pending_read_buffer, ch->notifications_enabled);
+    uint32_t current_gen = ch->read_generation;
+    NSLog(@"Wine: didUpdateValueForCharacteristic: found char, status=%d gen=%u notifications_enabled=%d",
+          read_status, current_gen, ch->notifications_enabled);
 
-    if (read_status == COREBTH_PENDING && ch->pending_read_buffer && ch->pending_read_len)
+    if (read_status == COREBTH_PENDING)
     {
         NSData *data = characteristic.value;
-        if (!data) {
+        if (error || !data) {
+            NSLog(@"Wine: didUpdateValueForCharacteristic: error or no data, setting INTERNAL_ERROR");
             char_set_read_status(ch, COREBTH_INTERNAL_ERROR);
-            dispatch_semaphore_signal(ch->pending_read);
-            corebth_char_release(ch);
-            return;
+            ch->pending_read_actual_len = 0;
+        } else {
+            uint32_t to_copy = MIN(COREBTH_MAX_CHAR_VALUE_SIZE, (uint32_t)data.length);
+            NSLog(@"Wine: didUpdateValueForCharacteristic: copying %u bytes to internal buffer", to_copy);
+            if (to_copy > 0 && data.bytes) {
+                memcpy(ch->pending_read_internal_buffer, data.bytes, to_copy);
+            }
+            ch->pending_read_actual_len = to_copy;
+            char_set_read_status(ch, COREBTH_SUCCESS);
         }
-        unsigned int to_copy = MIN(ch->pending_read_size, (unsigned int)data.length);
-        if (to_copy > 0 && data.bytes) {
-            memcpy(ch->pending_read_buffer, data.bytes, to_copy);
-        }
-        if (ch->pending_read_len) {
-            *ch->pending_read_len = to_copy;
-        }
-        char_set_read_status(ch, error ? COREBTH_INTERNAL_ERROR : COREBTH_SUCCESS);
+        ch->read_completed_gen = current_gen;
         dispatch_semaphore_signal(ch->pending_read);
     }
     else if (ch->notifications_enabled && !error)
     {
+        NSLog(@"Wine: didUpdateValueForCharacteristic: NOTIFICATION PATH - data.length=%lu", (unsigned long)characteristic.value.length);
         NSData *data = characteristic.value;
         struct corebth_notification_entry *notif_entry = calloc(1, sizeof(*notif_entry));
         if (notif_entry && data.length > 0) {
@@ -1481,7 +1490,9 @@ done:
                 memcpy(notif_entry->data, data.bytes, notif_entry->data_len);
                 notif_entry->next = NULL;
 
+                NSLog(@"Wine: didUpdateValueForCharacteristic: acquiring notification_mutex...");
                 pthread_mutex_lock(&ch->notification_mutex);
+                NSLog(@"Wine: didUpdateValueForCharacteristic: notification_mutex acquired");
                 if (ch->notification_queue_tail) {
                     ch->notification_queue_tail->next = notif_entry;
                 } else {
@@ -1489,12 +1500,15 @@ done:
                 }
                 ch->notification_queue_tail = notif_entry;
                 pthread_mutex_unlock(&ch->notification_mutex);
+                NSLog(@"Wine: didUpdateValueForCharacteristic: notification_mutex released, signaling semaphore");
 
                 dispatch_semaphore_signal(ch->notification_semaphore);
+                NSLog(@"Wine: didUpdateValueForCharacteristic: semaphore signaled");
             } else {
                 free(notif_entry);
             }
         }
+        NSLog(@"Wine: didUpdateValueForCharacteristic: NOTIFICATION PATH done");
     }
     else if (!error)
     {
@@ -1511,6 +1525,10 @@ done:
             }
         }
     }
+
+    NSLog(@"Wine: didUpdateValueForCharacteristic: releasing service_list_mutex");
+    pthread_mutex_unlock(&self.ctx->service_list_mutex);
+    NSLog(@"Wine: didUpdateValueForCharacteristic: DONE");
     corebth_char_release(ch);
 }
 
@@ -1521,11 +1539,14 @@ done:
 
     pthread_mutex_lock(&self.ctx->service_list_mutex);
     struct corebth_char_entry *ch = corebth_find_char_by_cb(self.ctx, characteristic);
-    if (ch) corebth_char_retain(ch);
-    pthread_mutex_unlock(&self.ctx->service_list_mutex);
+    if (!ch) {
+        pthread_mutex_unlock(&self.ctx->service_list_mutex);
+        return;
+    }
+    corebth_char_retain(ch);
 
-    if (!ch) return;
     if (char_is_invalidated(ch)) {
+        pthread_mutex_unlock(&self.ctx->service_list_mutex);
         corebth_char_release(ch);
         return;
     }
@@ -1542,8 +1563,11 @@ done:
         } else {
             char_set_write_status(ch, COREBTH_SUCCESS);
         }
+        ch->write_completed_gen = ch->write_generation;
         dispatch_semaphore_signal(ch->pending_write);
     }
+
+    pthread_mutex_unlock(&self.ctx->service_list_mutex);
     corebth_char_release(ch);
 }
 
@@ -1553,11 +1577,14 @@ done:
 
     pthread_mutex_lock(&self.ctx->service_list_mutex);
     struct corebth_char_entry *ch = corebth_find_char_by_cb(self.ctx, characteristic);
-    if (ch) corebth_char_retain(ch);
-    pthread_mutex_unlock(&self.ctx->service_list_mutex);
+    if (!ch) {
+        pthread_mutex_unlock(&self.ctx->service_list_mutex);
+        return;
+    }
+    corebth_char_retain(ch);
 
-    if (!ch) return;
     if (char_is_invalidated(ch)) {
+        pthread_mutex_unlock(&self.ctx->service_list_mutex);
         corebth_char_release(ch);
         return;
     }
@@ -1574,8 +1601,11 @@ done:
         } else {
             char_set_write_status(ch, COREBTH_SUCCESS);
         }
+        ch->write_completed_gen = ch->write_generation;
         dispatch_semaphore_signal(ch->pending_write);
     }
+
+    pthread_mutex_unlock(&self.ctx->service_list_mutex);
     corebth_char_release(ch);
 }
 
@@ -1702,6 +1732,7 @@ void corebth_free( void *connection )
     while (svc) {
         struct corebth_service_entry *next = svc->next_global;
         if (svc->path) unix_name_free(svc->path);
+        if (svc->service) CFBridgingRelease(svc->service);
         free(svc);
         svc = next;
     }
@@ -1923,7 +1954,7 @@ corebth_status corebth_characteristic_read( void *connection, const char *char_p
         return COREBTH_NOT_SUPPORTED;
     }
 
-    NSLog(@"Wine: corebth_characteristic_read: acquiring service_list_mutex...");
+    NSLog(@"Wine: corebth_characteristic_read: acquiring service_list_mutex (thread %p)...", pthread_self());
     pthread_mutex_lock(&ctx->service_list_mutex);
     NSLog(@"Wine: corebth_characteristic_read: service_list_mutex acquired, finding char...");
     ch = corebth_find_char_by_path(ctx, char_path);
@@ -1987,14 +2018,13 @@ corebth_status corebth_characteristic_read( void *connection, const char *char_p
         return COREBTH_SUCCESS;
     }
 
-    ch->pending_read_buffer = buffer;
-    ch->pending_read_size = buffer_size;
-    ch->pending_read_len = len;
+    uint32_t my_gen = ++ch->read_generation;
+    ch->read_completed_gen = 0;
     char_set_read_status(ch, COREBTH_PENDING);
+    ch->pending_read_actual_len = 0;
     sem = ch->pending_read;
-    while(dispatch_semaphore_wait(sem, DISPATCH_TIME_NOW) == 0);
     corebth_char_retain(ch);
-    
+
     pthread_mutex_unlock(&ctx->service_list_mutex);
 
     @autoreleasepool {
@@ -2020,10 +2050,9 @@ corebth_status corebth_characteristic_read( void *connection, const char *char_p
             }
             @catch (NSException *exception) {
                 NSLog(@"Wine: corebth_characteristic_read EXCEPTION in dispatch: %@", exception);
-                char_set_read_status(ch, COREBTH_INTERNAL_ERROR);
                 pthread_mutex_lock(&ctx->service_list_mutex);
-                ch->pending_read_buffer = NULL;
-                ch->pending_read_len = NULL;
+                char_set_read_status(ch, COREBTH_INTERNAL_ERROR);
+                ch->read_completed_gen = my_gen;
                 pthread_mutex_unlock(&ctx->service_list_mutex);
                 dispatch_semaphore_signal(sem);
             }
@@ -2031,36 +2060,38 @@ corebth_status corebth_characteristic_read( void *connection, const char *char_p
         NSLog(@"Wine: corebth_characteristic_read: dispatch_sync returned (waiting for callback)");
     }
 
-    NSLog(@"Wine: corebth_characteristic_read: waiting on semaphore (5s timeout)");
+    NSLog(@"Wine: corebth_characteristic_read: waiting on semaphore (5s timeout) gen=%u", my_gen);
     timeout = dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC);
-    if (dispatch_semaphore_wait(sem, timeout) != 0) {
-        NSLog(@"Wine: corebth_characteristic_read: SEMAPHORE TIMEOUT - callback never received!");
-        pthread_mutex_lock(&ctx->service_list_mutex);
-        
-        /* Fallback: Check if we have cached value */
+    dispatch_semaphore_wait(sem, timeout);
+
+    pthread_mutex_lock(&ctx->service_list_mutex);
+
+    if (ch->read_completed_gen == my_gen) {
+        uint32_t result_len = ch->pending_read_actual_len;
+        NSLog(@"Wine: corebth_characteristic_read: callback completed gen=%u len=%u", my_gen, result_len);
+        if (result_len > 0 && result_len <= buffer_size) {
+            memcpy(buffer, ch->pending_read_internal_buffer, result_len);
+            *len = result_len;
+        } else if (result_len == 0) {
+            *len = 0;
+        }
+        status = char_get_read_status(ch);
+    } else {
+        NSLog(@"Wine: corebth_characteristic_read: TIMEOUT or stale gen=%u completed_gen=%u",
+              my_gen, ch->read_completed_gen);
         NSData *cachedData = characteristic.value;
-        if (cachedData && ch->pending_read_buffer && ch->pending_read_len) {
-            unsigned int to_copy;
+        if (cachedData && cachedData.length > 0) {
+            unsigned int to_copy = MIN(buffer_size, (unsigned int)cachedData.length);
             NSLog(@"Wine: corebth_characteristic_read: TIMEOUT FALLBACK - using cached value length=%lu", (unsigned long)cachedData.length);
-            to_copy = MIN(ch->pending_read_size, (unsigned int)cachedData.length);
-            memcpy(ch->pending_read_buffer, cachedData.bytes, to_copy);
-            *ch->pending_read_len = to_copy;
-            char_set_read_status(ch, COREBTH_SUCCESS);
+            memcpy(buffer, cachedData.bytes, to_copy);
+            *len = to_copy;
             status = COREBTH_SUCCESS;
         } else {
-            char_set_read_status(ch, COREBTH_TIMEOUT);
-            status = COREBTH_DEVICE_NOT_READY;
+            status = COREBTH_TIMEOUT;
         }
-
-        ch->pending_read_buffer = NULL;
-        ch->pending_read_len = NULL;
-        pthread_mutex_unlock(&ctx->service_list_mutex);
-
-        corebth_char_release(ch);
-        return status;
     }
 
-    status = char_get_read_status(ch);
+    pthread_mutex_unlock(&ctx->service_list_mutex);
     corebth_char_release(ch);
     return status;
 }
@@ -2096,9 +2127,10 @@ corebth_status corebth_characteristic_write( void *connection, const char *char_
     peripheral = ch->service->peripheral->peripheral;
     characteristic = ch->characteristic;
 
+    uint32_t my_gen = ++ch->write_generation;
+    ch->write_completed_gen = 0;
     char_set_write_status(ch, COREBTH_PENDING);
     sem = ch->pending_write;
-    while(dispatch_semaphore_wait(sem, DISPATCH_TIME_NOW) == 0);
     corebth_char_retain(ch);
     pthread_mutex_unlock(&ctx->service_list_mutex);
 
@@ -2145,7 +2177,10 @@ corebth_status corebth_characteristic_write( void *connection, const char *char_
             }
             @catch (NSException *exception) {
                 NSLog(@"Wine: corebth_characteristic_write EXCEPTION in dispatch: %@", exception);
+                pthread_mutex_lock(&ctx->service_list_mutex);
                 char_set_write_status(ch, COREBTH_INTERNAL_ERROR);
+                ch->write_completed_gen = my_gen;
+                pthread_mutex_unlock(&ctx->service_list_mutex);
                 dispatch_semaphore_signal(sem);
             }
         });
@@ -2163,12 +2198,14 @@ corebth_status corebth_characteristic_write( void *connection, const char *char_
     timeout = dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC);
     wait_result = dispatch_semaphore_wait(sem, timeout);
 
-    if (wait_result != 0) {
-        corebth_char_release(ch);
-        return COREBTH_DEVICE_NOT_READY;
+    pthread_mutex_lock(&ctx->service_list_mutex);
+    if (ch->write_completed_gen == my_gen) {
+        status = char_get_write_status(ch);
+    } else {
+        status = COREBTH_TIMEOUT;
     }
+    pthread_mutex_unlock(&ctx->service_list_mutex);
 
-    status = ch->pending_write_status;
     corebth_char_release(ch);
     return status;
 }
@@ -2225,14 +2262,18 @@ corebth_status corebth_characteristic_read_notification( void *connection, const
     if (!ctx) return COREBTH_NOT_SUPPORTED;
     if (!buffer || !size) return COREBTH_INVALID_PARAMETER;
 
+    NSLog(@"Wine: corebth_characteristic_read_notification: acquiring service_list_mutex...");
     pthread_mutex_lock(&ctx->service_list_mutex);
+    NSLog(@"Wine: corebth_characteristic_read_notification: mutex acquired");
     ch = corebth_find_char_by_path(ctx, char_path);
     if (!ch) {
         pthread_mutex_unlock(&ctx->service_list_mutex);
+        NSLog(@"Wine: corebth_characteristic_read_notification: char not found, returning");
         return COREBTH_NOT_SUPPORTED;
     }
     corebth_char_retain(ch);
     pthread_mutex_unlock(&ctx->service_list_mutex);
+    NSLog(@"Wine: corebth_characteristic_read_notification: mutex released, waiting on semaphore (5s)...");
 
     timeout = dispatch_time(DISPATCH_TIME_NOW, 5LL * NSEC_PER_SEC);
     wait_result = dispatch_semaphore_wait(ch->notification_semaphore, timeout);

@@ -124,6 +124,7 @@ struct bluetooth_remote_device
     struct winebluetooth_device_properties props; /* Guarded by props_cs */
 
     BOOL le;                                    /* Guarded by props_cs */
+    BOOL macos_invalidated;                     /* Guarded by device_list_cs. Prevents TOCTOU races with macOS. */
     UNICODE_STRING bthle_symlink_name;          /* Guarded by props_cs */
     struct list gatt_services;                  /* Guarded by device_list_cs (list ops) */
 };
@@ -284,84 +285,41 @@ static inline LONG bluetooth_radio_decref( struct bluetooth_radio *radio )
     return InterlockedDecrement( &radio->refcount );
 }
 
-/* Find radio by handle and increment refcount. Caller must hold device_list_cs. */
-static struct bluetooth_radio *bluetooth_radio_find_and_incref( winebluetooth_radio_t handle )
-{
-    struct bluetooth_radio *radio;
-
-    LIST_FOR_EACH_ENTRY( radio, &device_list, struct bluetooth_radio, entry )
-    {
-        if (winebluetooth_radio_equal( handle, radio->radio ) &&
-            radio->state == BLUETOOTH_STATE_ACTIVE)
-        {
-            bluetooth_radio_incref( radio );
-            return radio;
-        }
-    }
-    return NULL;
-}
-
 /* Remote device reference counting */
 static inline void bluetooth_device_incref( struct bluetooth_remote_device *device )
 {
     InterlockedIncrement( &device->refcount );
 }
 
-static inline LONG bluetooth_device_decref( struct bluetooth_remote_device *device )
+/* Forward declaration */
+static void WINAPI bluetooth_irp_cancel_routine( DEVICE_OBJECT *device, IRP *irp );
+static void remote_device_destroy( struct bluetooth_remote_device *ext );
+
+static void bluetooth_device_async_destroy( struct bluetooth_remote_device *device )
 {
-    return InterlockedDecrement( &device->refcount );
+    remote_device_destroy( device );
 }
 
-/* Find device by handle and increment refcount. Caller must hold device_list_cs. */
-static struct bluetooth_remote_device *bluetooth_device_find_and_incref(
-    struct bluetooth_radio *radio, winebluetooth_device_t handle )
+static inline void bluetooth_device_decref( struct bluetooth_remote_device *device )
 {
-    struct bluetooth_remote_device *device;
-
-    LIST_FOR_EACH_ENTRY( device, &radio->remote_devices, struct bluetooth_remote_device, entry )
+    if (InterlockedDecrement( &device->refcount ) == 0)
     {
-        if (winebluetooth_device_equal( handle, device->device ) &&
-            device->state == BLUETOOTH_STATE_ACTIVE)
-        {
-            bluetooth_device_incref( device );
-            return device;
-        }
+        bluetooth_device_async_destroy( device );
     }
-    return NULL;
 }
 
-/* Find device by Bluetooth address and increment refcount. Caller must hold device_list_cs.
- *
- * IMPORTANT: We check state AND incref while still holding device_list_cs to avoid
- * a TOCTOU race where the device could transition to REMOVING between the check
- * and the incref. The incref must happen before releasing the lock. */
-static struct bluetooth_remote_device *bluetooth_device_find_by_addr_and_incref(
-    struct bluetooth_radio *radio, BTH_ADDR addr )
+/* Forward declaration */
+static void bluetooth_gatt_service_async_destroy( struct bluetooth_gatt_service *service )
 {
-    struct bluetooth_remote_device *device;
+    struct bluetooth_gatt_characteristic *cur, *next;
 
-    LIST_FOR_EACH_ENTRY( device, &radio->remote_devices, struct bluetooth_remote_device, entry )
+    winebluetooth_gatt_service_free( service->service );
+    LIST_FOR_EACH_ENTRY_SAFE( cur, next, &service->characteristics, struct bluetooth_gatt_characteristic, entry )
     {
-        BOOL match;
-
-        /* Check state first - if not ACTIVE, skip entirely */
-        if (device->state != BLUETOOTH_STATE_ACTIVE)
-            continue;
-
-        EnterCriticalSection( &device->props_cs );
-        match = (device->props_mask & WINEBLUETOOTH_DEVICE_PROPERTY_ADDRESS) &&
-                (device->props.address.ullLong == addr);
-        LeaveCriticalSection( &device->props_cs );
-
-        if (match)
-        {
-            /* Take reference while still holding device_list_cs.
-             * This ensures the object can't be freed before we get our ref. */
-            bluetooth_device_incref( device );
-            return device;
-        }
+        winebluetooth_gatt_characteristic_free( cur->characteristic );
+        free( cur );
     }
-    return NULL;
+    free( service );
 }
 
 /* GATT service reference counting */
@@ -370,9 +328,10 @@ static inline void bluetooth_gatt_service_incref( struct bluetooth_gatt_service 
     InterlockedIncrement( &service->refcount );
 }
 
-static inline LONG bluetooth_gatt_service_decref( struct bluetooth_gatt_service *service )
+static inline void bluetooth_gatt_service_decref( struct bluetooth_gatt_service *service )
 {
-    return InterlockedDecrement( &service->refcount );
+    if (InterlockedDecrement( &service->refcount ) == 0)
+        bluetooth_gatt_service_async_destroy( service );
 }
 
 /* State validation helpers */
@@ -396,6 +355,26 @@ static NTSTATUS bluetooth_remote_device_dispatch( DEVICE_OBJECT *device, struct 
 
     TRACE( "device=%p, ext=%p, irp=%p, code=%#lx\n", device, ext, irp, code );
 
+    /* State check for device-specific IOCTLs */
+    EnterCriticalSection( &device_list_cs );
+    if (ext->macos_invalidated)
+    {
+        LeaveCriticalSection( &device_list_cs );
+        status = STATUS_DEVICE_NOT_CONNECTED;
+        irp->IoStatus.Status = status;
+        IoCompleteRequest( irp, IO_NO_INCREMENT );
+        return status;
+    }
+    if (ext->state != BLUETOOTH_STATE_ACTIVE)
+    {
+        LeaveCriticalSection( &device_list_cs );
+        status = STATUS_DEVICE_NOT_CONNECTED;
+        irp->IoStatus.Status = status;
+        IoCompleteRequest( irp, IO_NO_INCREMENT );
+        return status;
+    }
+    LeaveCriticalSection( &device_list_cs );
+
     switch (code)
     {
     case IOCTL_WINEBTH_LE_DEVICE_GET_GATT_SERVICES:
@@ -405,6 +384,7 @@ static NTSTATUS bluetooth_remote_device_dispatch( DEVICE_OBJECT *device, struct 
         struct bluetooth_gatt_service *svc;
         SIZE_T rem;
         BOOL need_connect = FALSE;
+        BOOL connected = FALSE;
 
         if (!services || outsize < min_size)
         {
@@ -416,11 +396,22 @@ static NTSTATUS bluetooth_remote_device_dispatch( DEVICE_OBJECT *device, struct 
         status = STATUS_SUCCESS;
         services->count = 0;
 
+        EnterCriticalSection( &device_list_cs );
+        if (ext->macos_invalidated || ext->state != BLUETOOTH_STATE_ACTIVE)
+        {
+            LeaveCriticalSection( &device_list_cs );
+            status = STATUS_DEVICE_NOT_CONNECTED;
+            break;
+        }
+
         EnterCriticalSection( &ext->props_cs );
+        connected = ext->props.connected;
+        LeaveCriticalSection( &ext->props_cs );
+
         TRACE( "GET_GATT_SERVICES: device=%p device.handle=%p name='%s' gatt_empty=%d connected=%d\n",
                ext, (void*)ext->device.handle, ext->props.name,
-               list_empty( &ext->gatt_services ), ext->props.connected );
-        if (list_empty( &ext->gatt_services ) && !ext->props.connected)
+               list_empty( &ext->gatt_services ), connected );
+        if (list_empty( &ext->gatt_services ) && !connected)
         {
             need_connect = TRUE;
             TRACE( "GATT services requested but device not connected, triggering connect\n" );
@@ -441,7 +432,7 @@ static NTSTATUS bluetooth_remote_device_dispatch( DEVICE_OBJECT *device, struct 
                 rem--;
             }
         }
-        LeaveCriticalSection( &ext->props_cs );
+        LeaveCriticalSection( &device_list_cs );
 
         if (need_connect)
         {
@@ -459,7 +450,7 @@ static NTSTATUS bluetooth_remote_device_dispatch( DEVICE_OBJECT *device, struct 
         const SIZE_T min_size = offsetof( struct winebth_le_device_get_gatt_characteristics_params, characteristics[0] );
         struct winebth_le_device_get_gatt_characteristics_params *chars = irp->AssociatedIrp.SystemBuffer;
         struct bluetooth_gatt_characteristic *chrc;
-        struct bluetooth_gatt_service *service;
+        struct bluetooth_gatt_service *service = NULL;
         SIZE_T rem;
         GUID uuid;
 
@@ -474,16 +465,26 @@ static NTSTATUS bluetooth_remote_device_dispatch( DEVICE_OBJECT *device, struct 
         chars->count = 0;
         le_to_uuid( &chars->service.ServiceUuid, &uuid );
 
-        EnterCriticalSection( &ext->props_cs );
-        service = find_gatt_service( &ext->gatt_services, &uuid, chars->service.AttributeHandle );
-        if (!service)
+        EnterCriticalSection( &device_list_cs );
+        if (ext->macos_invalidated || ext->state != BLUETOOTH_STATE_ACTIVE)
         {
-            status = STATUS_INVALID_PARAMETER;
-            LeaveCriticalSection( &ext->props_cs );
+            LeaveCriticalSection( &device_list_cs );
+            status = STATUS_DEVICE_NOT_CONNECTED;
             break;
         }
 
-        /* Characteristics are immutable after discovery - no lock needed */
+        service = find_gatt_service( &ext->gatt_services, &uuid, chars->service.AttributeHandle );
+        if (!service)
+        {
+            LeaveCriticalSection( &device_list_cs );
+            status = STATUS_INVALID_PARAMETER;
+            break;
+        }
+
+        bluetooth_gatt_service_incref( service );
+        LeaveCriticalSection( &device_list_cs );
+
+        /* Characteristics are immutable after service discovery - no lock needed for read */
         LIST_FOR_EACH_ENTRY( chrc, &service->characteristics, struct bluetooth_gatt_characteristic, entry )
         {
             chars->count++;
@@ -493,7 +494,8 @@ static NTSTATUS bluetooth_remote_device_dispatch( DEVICE_OBJECT *device, struct 
                 rem--;
             }
         }
-        LeaveCriticalSection( &ext->props_cs );
+
+        bluetooth_gatt_service_decref( service );
 
         /* Sort characteristics by UUID - some apps (e.g. Square Golf) stop iterating early
          * and expect specific characteristics to appear before others. Windows appears to
@@ -982,6 +984,18 @@ static NTSTATUS bluetooth_radio_dispatch( DEVICE_OBJECT *device, struct bluetoot
                 status = winebluetooth_device_start_pairing( device->device, irp );
                 if (status == STATUS_PENDING)
                 {
+                    IoSetCancelRoutine( irp, bluetooth_irp_cancel_routine );
+
+                    if (irp->Cancel && IoSetCancelRoutine( irp, NULL ))
+                    {
+                        LeaveCriticalSection( &device_list_cs );
+                        irp->IoStatus.Status = STATUS_CANCELLED;
+                        irp->IoStatus.Information = 0;
+                        IoCompleteRequest( irp, IO_NO_INCREMENT );
+                        status = STATUS_CANCELLED;
+                        break;
+                    }
+
                     IoMarkIrpPending( irp );
                     InsertTailList( &ext->irp_list, &irp->Tail.Overlay.ListEntry );
                 }
@@ -1659,9 +1673,17 @@ static NTSTATUS bluetooth_radio_dispatch( DEVICE_OBJECT *device, struct bluetoot
                         chrc = find_gatt_characteristic( svc, &params->characteristic );
                         if (chrc)
                         {
+                            winebluetooth_gatt_characteristic_t characteristic = chrc->characteristic;
+                            bluetooth_gatt_service_incref( svc );
+                            LeaveCriticalSection( &device->props_cs );
+                            LeaveCriticalSection( &device_list_cs );
+
                             status = winebluetooth_gatt_characteristic_set_notify(
-                                chrc->characteristic,
+                                characteristic,
                                 params->enable );
+
+                            bluetooth_gatt_service_decref( svc );
+
                             if (status == STATUS_SUCCESS)
                                 irp->IoStatus.Information = sizeof(*params);
                             else
@@ -1866,6 +1888,7 @@ static void add_bluetooth_radio( struct winebluetooth_watcher_event_radio_added 
 
     EnterCriticalSection( &device_list_cs );
     list_add_tail( &device_list, &ext->radio.entry );
+    ext->radio.state = BLUETOOTH_STATE_ACTIVE;
     LeaveCriticalSection( &device_list_cs );
 
     IoInvalidateDeviceRelations( bus_pdo, BusRelations );
@@ -1874,6 +1897,7 @@ static void add_bluetooth_radio( struct winebluetooth_watcher_event_radio_added 
 static void remove_bluetooth_radio( winebluetooth_radio_t radio )
 {
     struct bluetooth_radio *device;
+    DEVICE_OBJECT *radio_device_obj = NULL;
 
     EnterCriticalSection( &device_list_cs );
     LIST_FOR_EACH_ENTRY( device, &device_list, struct bluetooth_radio, entry )
@@ -1883,11 +1907,15 @@ static void remove_bluetooth_radio( winebluetooth_radio_t radio )
             TRACE( "Removing bluetooth radio %p\n", (void *)radio.handle );
             device->state = BLUETOOTH_STATE_REMOVING;
             list_remove( &device->entry );
-            IoInvalidateDeviceRelations( device->device_obj, BusRelations );
+            radio_device_obj = device->device_obj;
             break;
         }
     }
     LeaveCriticalSection( &device_list_cs );
+
+    /* External calls outside lock */
+    if (radio_device_obj)
+        IoInvalidateDeviceRelations( radio_device_obj, BusRelations );
 
     IoInvalidateDeviceRelations( bus_pdo, BusRelations );
     winebluetooth_radio_free( radio );
@@ -1955,6 +1983,7 @@ static NTSTATUS bluetooth_device_set_properties( struct bluetooth_remote_device 
 static void bluetooth_radio_add_remote_device( struct winebluetooth_watcher_event_device_added event )
 {
     struct bluetooth_radio *radio;
+    DEVICE_OBJECT *radio_device_obj = NULL;
 
     EnterCriticalSection( &device_list_cs );
     LIST_FOR_EACH_ENTRY( radio, &device_list, struct bluetooth_radio, entry )
@@ -2036,11 +2065,16 @@ static void bluetooth_radio_add_remote_device( struct winebluetooth_watcher_even
             else
                 list_add_tail( &radio->remote_devices, &ext->remote_device.entry );
 
-            IoInvalidateDeviceRelations( radio->device_obj, BusRelations );
+            ext->remote_device.state = BLUETOOTH_STATE_ACTIVE;
+            radio_device_obj = radio->device_obj;
             break;
         }
     }
     LeaveCriticalSection( &device_list_cs );
+
+    /* External calls outside lock */
+    if (radio_device_obj)
+        IoInvalidateDeviceRelations( radio_device_obj, BusRelations );
 
     /* Device interface will be registered in IRP_MN_START_DEVICE or bluetooth_device_enable_le_iface.
      * Attempting to register here causes deadlocks because IoRegisterDeviceInterface triggers
@@ -2171,6 +2205,7 @@ static void bluetooth_radio_update_device_props( struct winebluetooth_watcher_ev
     BTH_DEVICE_INFO device_new_info = {0};
     DEVICE_OBJECT *radio_obj = NULL; /* The radio PDO the remote device exists on. */
     struct bluetooth_radio *radio;
+    struct bluetooth_remote_device *target_device = NULL;
     ULONG device_old_flags = 0;
     int device_count = 0;
 
@@ -2182,12 +2217,10 @@ static void bluetooth_radio_update_device_props( struct winebluetooth_watcher_ev
         LIST_FOR_EACH_ENTRY( device, &radio->remote_devices, struct bluetooth_remote_device, entry )
         {
             BTH_DEVICE_INFO old_info = {0};
-            BLUETOOTH_ADDRESS adapter_addr;
 
             device_count++;
             if (winebluetooth_device_equal( event.device, device->device ))
             {
-                adapter_addr = radio->props.address;
                 EnterCriticalSection( &device->props_cs );
 
                 device->props_mask |= event.changed_props_mask;
@@ -2201,6 +2234,8 @@ static void bluetooth_radio_update_device_props( struct winebluetooth_watcher_ev
                     ERR("=== bluetooth_radio_update_device_props: UPDATING device connected: %d -> %d ===\n",
                         device->props.connected, event.props.connected);
                     device->props.connected = event.props.connected;
+                    if (!device->props.connected)
+                        device->macos_invalidated = TRUE;
                 }
                 if (event.changed_props_mask & WINEBLUETOOTH_DEVICE_PROPERTY_PAIRED)
                     device->props.paired = event.props.paired;
@@ -2211,21 +2246,59 @@ static void bluetooth_radio_update_device_props( struct winebluetooth_watcher_ev
                 if (event.changed_props_mask & WINEBLUETOOTH_DEVICE_PROPERTY_CLASS)
                     device->props.class = event.props.class;
                 winebluetooth_device_properties_to_info( device->props_mask, &device->props, &device_new_info );
-                bluetooth_device_set_properties( device, adapter_addr.rgBytes, &device->props, device->props_mask, device->le );
+
+                /* Copy data needed for external call */
+                device_old_flags = old_info.flags;
+                radio_obj = radio->device_obj;
+                bluetooth_device_incref( device );
+                target_device = device;
                 LeaveCriticalSection( &device->props_cs );
 
-                device_old_flags = old_info.flags;
                 goto done;
             }
         }
     }
 done:
+    LeaveCriticalSection( &device_list_cs );
+
     winebluetooth_device_free( event.device );
 
-    if (radio_obj)
-        bluetooth_radio_report_radio_in_range_event( radio_obj, device_old_flags, &device_new_info );
+    /* External calls outside lock */
+    if (target_device && radio_obj)
+    {
+        /* NOTE: IoSetDevicePropertyData is called while holding props_cs. This is acceptable because:
+         * 1. These are Wine-internal kernel functions with no callbacks
+         * 2. They don't acquire any bluetooth-related locks
+         * 3. The winebus.sys driver uses the same pattern
+         *
+         * MITIGATION for recursive PnP events:
+         * If setting a property triggers a synchronous TARGET_DEVICE_CUSTOM_NOTIFICATION that
+         * attempts to re-acquire device_list_cs, we would deadlock. To prevent this:
+         * - Audit all DEVPKEY values set here to ensure none trigger PnP notifications
+         * - If any do, refactor to collect updates in a local struct, release lock, then apply
+         * - Current properties (FriendlyName, Address, etc.) are data-only and safe
+         *
+         * If issues arise, refactor to collect updates and apply after releasing lock.
+         */
+        BLUETOOTH_ADDRESS adapter_addr;
+        struct winebluetooth_device_properties props_copy;
+        winebluetooth_device_props_mask_t props_mask_copy;
+        BOOL le_copy;
 
-    LeaveCriticalSection( &device_list_cs );
+        EnterCriticalSection( &device_list_cs );
+        adapter_addr = target_device->radio->props.address;
+        LeaveCriticalSection( &device_list_cs );
+
+        EnterCriticalSection( &target_device->props_cs );
+        props_copy = target_device->props;
+        props_mask_copy = target_device->props_mask;
+        le_copy = target_device->le;
+        bluetooth_device_set_properties( target_device, adapter_addr.rgBytes, &props_copy, props_mask_copy, le_copy );
+        LeaveCriticalSection( &target_device->props_cs );
+
+        bluetooth_radio_report_radio_in_range_event( radio_obj, device_old_flags, &device_new_info );
+        bluetooth_device_decref( target_device );
+    }
 }
 
 static void bluetooth_radio_report_auth_event( struct winebluetooth_auth_event event )
@@ -2279,36 +2352,94 @@ static void bluetooth_radio_report_auth_event( struct winebluetooth_auth_event e
     ExFreePool( notification );
 }
 
-static void complete_irp( IRP *irp, NTSTATUS result )
+/* Cancel routine for pending pairing IRPs */
+static void WINAPI bluetooth_irp_cancel_routine( DEVICE_OBJECT *device, IRP *irp )
 {
+    IoReleaseCancelSpinLock( irp->CancelIrql );
+
     EnterCriticalSection( &device_list_cs );
     RemoveEntryList( &irp->Tail.Overlay.ListEntry );
     LeaveCriticalSection( &device_list_cs );
 
-    irp->IoStatus.Status = result;
+    irp->IoStatus.Status = STATUS_CANCELLED;
+    irp->IoStatus.Information = 0;
     IoCompleteRequest( irp, IO_NO_INCREMENT );
 }
 
+/* Complete a pending IRP from the pairing list.
+ * Returns TRUE if we completed it, FALSE if cancel routine will. */
+static BOOL complete_irp( IRP *irp, NTSTATUS result )
+{
+    EnterCriticalSection( &device_list_cs );
+
+    if (IoSetCancelRoutine( irp, NULL ) == NULL)
+    {
+        LeaveCriticalSection( &device_list_cs );
+        return FALSE;
+    }
+
+    RemoveEntryList( &irp->Tail.Overlay.ListEntry );
+    LeaveCriticalSection( &device_list_cs );
+
+    irp->IoStatus.Status = result;
+    irp->IoStatus.Information = 0;
+    IoCompleteRequest( irp, IO_NO_INCREMENT );
+    return TRUE;
+}
+
+/* Caller must hold a reference to device. May be called with or without device_list_cs. */
 static void bluetooth_device_enable_le_iface( struct bluetooth_remote_device *device )
 {
-    EnterCriticalSection( &device->props_cs );
-    if (device->le)
+    UNICODE_STRING symlink_name;
+    BOOL should_register = FALSE;
+    NTSTATUS status;
+    DEVICE_OBJECT *device_obj;
+    enum bluetooth_object_state device_state;
+
+    RtlInitUnicodeString( &symlink_name, NULL );
+    device_obj = device->device_obj;
+
+    /* Check state - use atomic read since we might not hold device_list_cs */
+    device_state = (enum bluetooth_object_state)InterlockedCompareExchange( (LONG *)&device->state, 0, 0 );
+    if (device_state != BLUETOOTH_STATE_ACTIVE)
     {
+        /* Device not yet started, just set the flag. PnP start will register interface. */
+        EnterCriticalSection( &device->props_cs );
+        device->le = TRUE;
         LeaveCriticalSection( &device->props_cs );
         return;
     }
-    device->le = TRUE;
-    /* Register the LE interface immediately. We can't wait for IRP_MN_START_DEVICE because
-     * Wine's PnP enumeration may never send it for dynamically discovered BLE devices.
-     * This is a workaround - on real Windows, the interface would be registered in START_DEVICE.
-     * Use address as reference string for consistent symlink format. */
-    if (!device->bthle_symlink_name.Buffer)
+
+    EnterCriticalSection( &device->props_cs );
+    if (device->le)
     {
-        /* Device interface registration moved to IRP_MN_START_DEVICE to avoid PnP enumeration timing issues.
-         * Early registration here would fail because Wine's PnP manager hasn't processed the device yet. */
-        TRACE( "LE interface will be registered during IRP_MN_START_DEVICE for device %p\n", device->device_obj );
+        /* Already enabled */
+        LeaveCriticalSection( &device->props_cs );
+        return;
     }
+
+    device->le = TRUE;
+    should_register = !device->bthle_symlink_name.Buffer;
     LeaveCriticalSection( &device->props_cs );
+
+    /* External calls outside lock */
+    if (should_register)
+    {
+        status = IoRegisterDeviceInterface( device_obj, &GUID_BLUETOOTHLE_DEVICE_INTERFACE,
+                                            NULL, &symlink_name );
+        if (!status)
+        {
+            IoSetDeviceInterfaceState( &symlink_name, TRUE );
+
+            /* Now update the device struct with the symlink */
+            EnterCriticalSection( &device->props_cs );
+            if (!device->bthle_symlink_name.Buffer)
+                device->bthle_symlink_name = symlink_name;
+            else
+                RtlFreeUnicodeString( &symlink_name );
+            LeaveCriticalSection( &device->props_cs );
+        }
+    }
 }
 
 static void bluetooth_device_add_gatt_service( struct winebluetooth_watcher_event_gatt_service_added event )
@@ -2378,6 +2509,7 @@ static void bluetooth_device_add_gatt_service( struct winebluetooth_watcher_even
 
 static void bluetooth_gatt_service_remove( winebluetooth_gatt_service_t service )
 {
+    struct bluetooth_gatt_service *found_svc = NULL;
     struct bluetooth_radio *radio;
 
     EnterCriticalSection( &device_list_cs );
@@ -2399,26 +2531,21 @@ static void bluetooth_gatt_service_remove( winebluetooth_gatt_service_t service 
             {
                 if (winebluetooth_gatt_service_equal( svc->service, service ))
                 {
-                    struct bluetooth_gatt_characteristic *cur, *next;
-
                     list_remove( &svc->entry );
-                    LeaveCriticalSection( &device->props_cs );
-                    LeaveCriticalSection( &device_list_cs );
-                    winebluetooth_gatt_service_free( svc->service );
-                    LIST_FOR_EACH_ENTRY_SAFE( cur, next, &svc->characteristics, struct bluetooth_gatt_characteristic, entry )
-                    {
-                        winebluetooth_gatt_characteristic_free( cur->characteristic );
-                        free( cur );
-                    }
-                    free( svc );
-                    winebluetooth_gatt_service_free( service );
-                    return;
+                    found_svc = svc;
+                    break;
                 }
             }
             LeaveCriticalSection( &device->props_cs );
+            if (found_svc) break;
         }
+        if (found_svc) break;
     }
     LeaveCriticalSection( &device_list_cs );
+
+    if (found_svc)
+        bluetooth_gatt_service_decref( found_svc );
+
     winebluetooth_gatt_service_free( service );
 }
 
@@ -2813,6 +2940,7 @@ static void bluetooth_radio_set_properties( DEVICE_OBJECT *obj,
 }
 
 /* Caller should hold device_list_cs. */
+/* Caller should hold device_list_cs. */
 static void remove_pending_irps( struct bluetooth_radio *radio )
 {
     LIST_ENTRY *entry;
@@ -2821,6 +2949,10 @@ static void remove_pending_irps( struct bluetooth_radio *radio )
     while ((entry = RemoveHeadList( &radio->irp_list )) != &radio->irp_list)
     {
         irp = CONTAINING_RECORD( entry, IRP, Tail.Overlay.ListEntry );
+
+        if (IoSetCancelRoutine( irp, NULL ) == NULL)
+            continue;
+
         irp->IoStatus.Status = STATUS_DELETE_PENDING;
         irp->IoStatus.Information = 0;
         IoCompleteRequest( irp, IO_NO_INCREMENT );
@@ -2878,20 +3010,25 @@ static NTSTATUS WINAPI remote_device_pdo_pnp( DEVICE_OBJECT *device_obj, struct 
 
         EnterCriticalSection( &device_list_cs );
         adapter_addr = ext->radio->props.address;
-        LeaveCriticalSection( &device_list_cs );
-
-        EnterCriticalSection( &ext->props_cs );
+        if (ext->state != BLUETOOTH_STATE_INITIALIZING && ext->state != BLUETOOTH_STATE_ACTIVE)
+        {
+            LeaveCriticalSection( &device_list_cs );
+            ret = STATUS_DEVICE_NOT_CONNECTED;
+            break;
+        }
         already_started = (ext->state == BLUETOOTH_STATE_ACTIVE);
+        if (!already_started)
+            ext->state = BLUETOOTH_STATE_ACTIVE;
+        LeaveCriticalSection( &device_list_cs );
 
         if (already_started)
         {
             TRACE( "Device already started (unexpected - should only start at START_DEVICE)\n" );
-            LeaveCriticalSection( &ext->props_cs );
             ret = STATUS_SUCCESS;
             break;
         }
 
-        ext->state = BLUETOOTH_STATE_ACTIVE;
+        EnterCriticalSection( &ext->props_cs );
 
         /* Copy data needed for expensive operations, then release lock */
         props_copy = ext->props;
@@ -2945,27 +3082,41 @@ static NTSTATUS WINAPI remote_device_pdo_pnp( DEVICE_OBJECT *device_obj, struct 
     }
     case IRP_MN_REMOVE_DEVICE:
     {
+        BOOL dropped_ref = FALSE;
         EnterCriticalSection( &device_list_cs );
         if (ext->state != BLUETOOTH_STATE_REMOVING)
         {
             WARN( "IRP_MN_REMOVE_DEVICE called without prior SURPRISE_REMOVAL for device %s\n", ext->props.name );
             ext->state = BLUETOOTH_STATE_REMOVING;
             list_remove( &ext->entry );
+            ext->macos_invalidated = TRUE;
+            dropped_ref = TRUE;
         }
         LeaveCriticalSection( &device_list_cs );
-        remote_device_destroy( ext );
-        ret = STATUS_SUCCESS;
-        break;
+
+        if (dropped_ref)
+            bluetooth_device_decref( ext );
+
+        irp->IoStatus.Status = STATUS_SUCCESS;
+        IoCompleteRequest( irp, IO_NO_INCREMENT );
+        return STATUS_SUCCESS;
     }
     case IRP_MN_SURPRISE_REMOVAL:
     {
+        BOOL dropped_ref = FALSE;
         EnterCriticalSection( &device_list_cs);
         if (ext->state != BLUETOOTH_STATE_REMOVING)
         {
             ext->state = BLUETOOTH_STATE_REMOVING;
             list_remove( &ext->entry );
+            ext->macos_invalidated = TRUE;
+            dropped_ref = TRUE;
         }
         LeaveCriticalSection( &device_list_cs );
+
+        if (dropped_ref)
+            bluetooth_device_decref( ext );
+
         ret = STATUS_SUCCESS;
         break;
     }
