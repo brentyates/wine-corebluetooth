@@ -34,7 +34,7 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
 {
     const WCHAR *buffer = WindowsGetStringRawBuffer( classid, NULL );
 
-    TRACE( "class %s, factory %p.\n", debugstr_hstring(classid), factory );
+    TRACE( " DllGetActivationFactory CALLED === class %s\n", debugstr_w(buffer) );
 
     *factory = NULL;
 
@@ -44,9 +44,14 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
         IActivationFactory_QueryInterface( bluetoothdevice_statics_factory, &IID_IActivationFactory, (void **)factory );
     if (!wcscmp( buffer, RuntimeClass_Windows_Devices_Bluetooth_BluetoothLEDevice ))
         IActivationFactory_QueryInterface( bluetoothledevice_statics_factory, &IID_IActivationFactory, (void **)factory );
-    if (!wcscmp( buffer, RuntimeClass_Windows_Devices_Bluetooth_Advertisement_BluetoothLEAdvertisementWatcher))
+    if (!wcscmp( buffer, RuntimeClass_Windows_Devices_Bluetooth_Advertisement_BluetoothLEAdvertisementWatcher ))
         IActivationFactory_QueryInterface( advertisement_watcher_factory, &IID_IActivationFactory, (void **)factory );
+    if (!wcscmp( buffer, RuntimeClass_Windows_Devices_Bluetooth_Advertisement_BluetoothLEAdvertisementFilter ))
+        IActivationFactory_QueryInterface( advertisement_filter_factory, &IID_IActivationFactory, (void **)factory );
+    if (!wcscmp( buffer, RuntimeClass_Windows_Devices_Bluetooth_Advertisement_BluetoothLEAdvertisement ))
+        IActivationFactory_QueryInterface( advertisement_factory, &IID_IActivationFactory, (void **)factory );
 
+    TRACE( " Result: factory=%p ===\n", *factory );
     if (*factory) return S_OK;
     return CLASS_E_CLASSNOTAVAILABLE;
 }

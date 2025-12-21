@@ -41,4 +41,6 @@ namespace Windows.Devices.Bluetooth {
 }
 namespace Windows.Devices.Bluetooth.Advertisement {
     runtimeclass BluetoothLEAdvertisementWatcher;
+    runtimeclass BluetoothLEAdvertisementFilter;
+    runtimeclass BluetoothLEAdvertisement;
 }

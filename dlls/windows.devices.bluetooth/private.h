@@ -40,11 +40,17 @@
 #include "windows.devices.bluetooth.h"
 #define WIDL_using_Windows_Devices_Bluetooth_Advertisement
 #include "windows.devices.bluetooth.advertisement.h"
+#define WIDL_using_Windows_Devices_Bluetooth_GenericAttributeProfile
+#include "windows.devices.bluetooth.genericattributeprofile.h"
+#define WIDL_using_Windows_Devices_Enumeration
+#include "windows.devices.enumeration.h"
 
 extern IActivationFactory *bluetoothadapter_factory;
 extern IActivationFactory *bluetoothdevice_statics_factory;
 extern IActivationFactory *bluetoothledevice_statics_factory;
 extern IActivationFactory *advertisement_watcher_factory;
+extern IActivationFactory *advertisement_filter_factory;
+extern IActivationFactory *advertisement_factory;
 
 #define DEFINE_IINSPECTABLE_( pfx, iface_type, impl_type, impl_from, iface_mem, expr )             \
     static inline impl_type *impl_from( iface_type *iface )                                        \

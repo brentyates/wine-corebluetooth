@@ -1,5 +1,5 @@
 MODULE  = windows.devices.bluetooth.dll
-IMPORTS = combase
+IMPORTS = combase setupapi advapi32
 
 SOURCES = \
 	advertisement.c \
