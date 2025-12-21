@@ -349,6 +349,7 @@ struct corebth_char_entry
     uint32_t write_generation;
     uint32_t write_completed_gen;
     BOOL notifications_enabled;
+    BOOL read_awaiting_response;  /* Set on bt_queue right before readValueForCharacteristic */
     pthread_mutex_t notification_mutex;
     dispatch_semaphore_t notification_semaphore;
     struct corebth_notification_entry *notification_queue_head;
@@ -948,6 +949,7 @@ static void corebth_invalidate_peripheral_chars(struct corebth_peripheral_entry 
     struct corebth_service_entry *svc;
     struct corebth_char_entry *ch;
 
+    /* Called from disconnect callback on bt_queue */
     for (svc = periph->services; svc; svc = svc->next)
     {
         for (ch = svc->chars; ch; ch = ch->next)
@@ -955,6 +957,7 @@ static void corebth_invalidate_peripheral_chars(struct corebth_peripheral_entry 
             char_set_invalidated(ch);
             char_set_read_status(ch, COREBTH_DEVICE_DISCONNECTED);
             char_set_write_status(ch, COREBTH_DEVICE_DISCONNECTED);
+            ch->read_awaiting_response = NO;  /* Clear flag to prevent stale state */
             dispatch_semaphore_signal(ch->pending_read);
             dispatch_semaphore_signal(ch->pending_write);
         }
@@ -1001,6 +1004,7 @@ static struct corebth_char_entry *corebth_add_char(struct corebth_context *ctx,
     char_set_write_status(entry, COREBTH_IDLE);
     atomic_store_explicit(&entry->invalidated, NO, memory_order_release);
     entry->notifications_enabled = FALSE;
+    entry->read_awaiting_response = NO;
     pthread_mutex_init(&entry->notification_mutex, NULL);
     entry->notification_semaphore = dispatch_semaphore_create(0);
     entry->notification_queue_head = NULL;
@@ -1454,21 +1458,29 @@ done:
         return;
     }
 
-    corebth_status read_status = char_get_read_status(ch);
     uint32_t current_gen = ch->read_generation;
-    NSLog(@"Wine: didUpdateValueForCharacteristic: found char, status=%d gen=%u notifications_enabled=%d",
-          read_status, current_gen, ch->notifications_enabled);
+    BOOL is_read_response = ch->read_awaiting_response;
+    NSLog(@"Wine: didUpdateValueForCharacteristic: found char, read_awaiting=%d gen=%u notifications_enabled=%d",
+          is_read_response, current_gen, ch->notifications_enabled);
 
-    if (read_status == COREBTH_PENDING)
+    /* CRITICAL: Check read_awaiting_response first. This flag is set ON bt_queue
+     * right before readValueForCharacteristic is called. Since bt_queue is serial,
+     * if this flag is YES, this callback MUST be the response to that read request,
+     * not a notification. This avoids the race condition where a notification
+     * arriving during a pending read was incorrectly processed as the read response. */
+    if (is_read_response)
     {
+        /* Clear the flag immediately - we're handling the read response now */
+        ch->read_awaiting_response = NO;
+
         NSData *data = characteristic.value;
         if (error || !data) {
-            NSLog(@"Wine: didUpdateValueForCharacteristic: error or no data, setting INTERNAL_ERROR");
+            NSLog(@"Wine: didUpdateValueForCharacteristic: READ RESPONSE - error or no data, setting INTERNAL_ERROR");
             char_set_read_status(ch, COREBTH_INTERNAL_ERROR);
             ch->pending_read_actual_len = 0;
         } else {
             uint32_t to_copy = MIN(COREBTH_MAX_CHAR_VALUE_SIZE, (uint32_t)data.length);
-            NSLog(@"Wine: didUpdateValueForCharacteristic: copying %u bytes to internal buffer", to_copy);
+            NSLog(@"Wine: didUpdateValueForCharacteristic: READ RESPONSE - copying %u bytes to internal buffer", to_copy);
             if (to_copy > 0 && data.bytes) {
                 memcpy(ch->pending_read_internal_buffer, data.bytes, to_copy);
             }
@@ -2045,11 +2057,17 @@ corebth_status corebth_characteristic_read( void *connection, const char *char_p
             NSLog(@"Wine: corebth_characteristic_read: characteristic=%p uuid=%@ service=%@ properties=0x%lx",
                   characteristic, characteristic.UUID, characteristic.service.UUID, (unsigned long)characteristic.properties);
             @try {
+                /* CRITICAL: Set this flag ON bt_queue right before the read call.
+                 * Since bt_queue is serial, the callback cannot run until this block completes.
+                 * This ensures the callback will see read_awaiting_response=YES and know
+                 * this is a read response, not a notification. */
+                ch->read_awaiting_response = YES;
                 [peripheral readValueForCharacteristic:characteristic];
                 NSLog(@"Wine: corebth_characteristic_read: readValueForCharacteristic called successfully");
             }
             @catch (NSException *exception) {
                 NSLog(@"Wine: corebth_characteristic_read EXCEPTION in dispatch: %@", exception);
+                ch->read_awaiting_response = NO;
                 pthread_mutex_lock(&ctx->service_list_mutex);
                 char_set_read_status(ch, COREBTH_INTERNAL_ERROR);
                 ch->read_completed_gen = my_gen;
@@ -2072,13 +2090,29 @@ corebth_status corebth_characteristic_read( void *connection, const char *char_p
         if (result_len > 0 && result_len <= buffer_size) {
             memcpy(buffer, ch->pending_read_internal_buffer, result_len);
             *len = result_len;
-        } else if (result_len == 0) {
+        } else if (result_len > buffer_size) {
+            /* Data larger than buffer - copy what fits and report actual size */
+            memcpy(buffer, ch->pending_read_internal_buffer, buffer_size);
+            *len = buffer_size;
+            NSLog(@"Wine: corebth_characteristic_read: WARNING - data truncated from %u to %u bytes",
+                  result_len, buffer_size);
+        } else {
             *len = 0;
         }
         status = char_get_read_status(ch);
     } else {
         NSLog(@"Wine: corebth_characteristic_read: TIMEOUT or stale gen=%u completed_gen=%u",
               my_gen, ch->read_completed_gen);
+
+        /* Clear the read_awaiting_response flag on bt_queue since the callback
+         * never processed our read request. We dispatch_async because we're not
+         * on bt_queue here, and the flag must only be accessed from bt_queue. */
+        corebth_char_retain(ch);  /* prevent ch from being freed before block runs */
+        dispatch_async(ctx->bt_queue, ^{
+            ch->read_awaiting_response = NO;
+            corebth_char_release(ch);
+        });
+
         NSData *cachedData = characteristic.value;
         if (cachedData && cachedData.length > 0) {
             unsigned int to_copy = MIN(buffer_size, (unsigned int)cachedData.length);
@@ -2087,6 +2121,7 @@ corebth_status corebth_characteristic_read( void *connection, const char *char_p
             *len = to_copy;
             status = COREBTH_SUCCESS;
         } else {
+            *len = 0;
             status = COREBTH_TIMEOUT;
         }
     }
