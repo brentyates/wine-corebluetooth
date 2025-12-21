@@ -225,6 +225,73 @@ void winebluetooth_gatt_characteristic_free( winebluetooth_gatt_characteristic_t
     UNIX_BLUETOOTH_CALL( bluetooth_gatt_characteristic_free, &args );
 }
 
+void winebluetooth_gatt_characteristic_dup( winebluetooth_gatt_characteristic_t characteristic )
+{
+    struct bluetooth_gatt_characteristic_dup_params args = {0};
+
+    TRACE( "(%p)\n", (void *)characteristic.handle );
+
+    args.characteristic = characteristic.handle;
+    UNIX_BLUETOOTH_CALL( bluetooth_gatt_characteristic_dup, &args );
+}
+
+NTSTATUS winebluetooth_gatt_characteristic_read( winebluetooth_gatt_characteristic_t characteristic,
+                                                  unsigned char *buffer, unsigned int buffer_size,
+                                                  unsigned int *data_len )
+{
+    struct bluetooth_gatt_characteristic_read_params args = {0};
+
+    TRACE( "(%p, %p, %u, %p)\n", (void *)characteristic.handle, buffer, buffer_size, data_len );
+
+    args.characteristic = characteristic.handle;
+    args.buffer = buffer;
+    args.buffer_size = buffer_size;
+    args.data_len = data_len;
+    return UNIX_BLUETOOTH_CALL( bluetooth_gatt_characteristic_read, &args );
+}
+
+NTSTATUS winebluetooth_gatt_characteristic_write( winebluetooth_gatt_characteristic_t characteristic,
+                                                   const unsigned char *data, unsigned int size,
+                                                   int write_type )
+{
+    struct bluetooth_gatt_characteristic_write_params args = {0};
+
+    TRACE( "(%p, %p, %u, %d)\n", (void *)characteristic.handle, data, size, write_type );
+
+    args.characteristic = characteristic.handle;
+    args.data = data;
+    args.size = size;
+    args.write_type = write_type;
+    return UNIX_BLUETOOTH_CALL( bluetooth_gatt_characteristic_write, &args );
+}
+
+NTSTATUS winebluetooth_gatt_characteristic_set_notify( winebluetooth_gatt_characteristic_t characteristic,
+                                                        int enable )
+{
+    struct bluetooth_gatt_characteristic_set_notify_params args = {0};
+
+    TRACE( "(%p, %d)\n", (void *)characteristic.handle, enable );
+
+    args.characteristic = characteristic.handle;
+    args.enable = enable;
+    return UNIX_BLUETOOTH_CALL( bluetooth_gatt_characteristic_set_notify, &args );
+}
+
+NTSTATUS winebluetooth_gatt_characteristic_read_notification( winebluetooth_gatt_characteristic_t characteristic,
+                                                               unsigned char *buffer, unsigned int buffer_size,
+                                                               unsigned int *size )
+{
+    struct bluetooth_gatt_characteristic_read_notification_params args = {0};
+
+    TRACE( "(%p, %p, %u, %p)\n", (void *)characteristic.handle, buffer, buffer_size, size );
+
+    args.characteristic = characteristic.handle;
+    args.buffer = buffer;
+    args.buffer_size = buffer_size;
+    args.size = size;
+    return UNIX_BLUETOOTH_CALL( bluetooth_gatt_characteristic_read_notification, &args );
+}
+
 NTSTATUS winebluetooth_get_event( struct winebluetooth_event *result )
 {
     struct bluetooth_get_event_params params = {0};
