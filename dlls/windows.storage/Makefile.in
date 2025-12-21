@@ -3,5 +3,6 @@ IMPORTS = shell32 combase
 
 SOURCES = \
 	classes.idl \
+	datareader.c \
 	main.c \
 	streams.c
