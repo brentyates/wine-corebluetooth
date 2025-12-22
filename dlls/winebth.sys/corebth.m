@@ -37,6 +37,7 @@
 #include <string.h>
 #include <stdio.h>
 
+
 struct corebth_context;
 struct corebth_peripheral_entry;
 
@@ -1413,9 +1414,13 @@ done:
 
 - (void)peripheral:(CBPeripheral *)peripheral didUpdateValueForCharacteristic:(CBCharacteristic *)characteristic error:(NSError *)error
 {
+    NSLog(@"didUpdateValueForCharacteristic FIRED: char=%p uuid=%@ error=%@",
+        characteristic,
+        [characteristic.UUID UUIDString],
+        error ? [error description] : @"nil");
 
     if (!self.ctx) {
-
+        NSLog(@"didUpdateValueForCharacteristic: self.ctx is nil!");
         return;
     }
 
@@ -1423,10 +1428,11 @@ done:
     struct corebth_char_entry *ch = corebth_find_char_by_cb(self.ctx, characteristic);
     if (!ch) {
         pthread_mutex_unlock(&self.ctx->service_list_mutex);
-
+        NSLog(@"didUpdateValueForCharacteristic: corebth_find_char_by_cb returned NULL for char=%p", characteristic);
         return;
     }
     corebth_char_retain(ch);
+    NSLog(@"didUpdateValueForCharacteristic: found ch=%p read_awaiting_response=%d", ch, ch->read_awaiting_response);
 
     if (char_is_invalidated(ch)) {
         pthread_mutex_unlock(&self.ctx->service_list_mutex);
@@ -1994,8 +2000,27 @@ corebth_status corebth_characteristic_read( void *connection, const char *char_p
     @autoreleasepool {
         /* IMPORTANT: CoreBluetooth requires peripheral methods to be called from the same queue
          * that the CBCentralManager was created with. Dispatch to bt_queue. */
-        if (!ctx->bt_queue)
+        if (!ctx->bt_queue) {
+            NSLog(@"corebth_characteristic_read: bt_queue is NULL!");
+            corebth_char_release(ch);
             return COREBTH_INTERNAL_ERROR;
+        }
+
+        if (!peripheral.delegate) {
+            NSLog(@"corebth_characteristic_read: peripheral.delegate is nil!");
+            corebth_char_release(ch);
+            return COREBTH_INTERNAL_ERROR;
+        }
+
+        if (peripheral.state != CBPeripheralStateConnected) {
+            NSLog(@"corebth_characteristic_read: peripheral not connected (state=%ld)!",
+                (long)peripheral.state);
+            corebth_char_release(ch);
+            return COREBTH_DEVICE_NOT_READY;
+        }
+
+        NSLog(@"corebth_characteristic_read: calling readValueForCharacteristic for char=%p peripheral=%p delegate=%p",
+            (__bridge void *)characteristic, (__bridge void *)peripheral, (__bridge void *)peripheral.delegate);
 
         dispatch_sync(ctx->bt_queue, ^{
             @try {
@@ -2004,9 +2029,12 @@ corebth_status corebth_characteristic_read( void *connection, const char *char_p
                  * This ensures the callback will see read_awaiting_response=YES and know
                  * this is a read response, not a notification. */
                 ch->read_awaiting_response = YES;
+                NSLog(@"corebth_characteristic_read: dispatched to bt_queue, calling read NOW");
                 [peripheral readValueForCharacteristic:characteristic];
+                NSLog(@"corebth_characteristic_read: readValueForCharacteristic returned");
             }
             @catch (NSException *exception) {
+                NSLog(@"corebth_characteristic_read: exception: %@", [exception description]);
                 ch->read_awaiting_response = NO;
                 pthread_mutex_lock(&ctx->service_list_mutex);
                 char_set_read_status(ch, COREBTH_INTERNAL_ERROR);

@@ -1688,6 +1688,7 @@ static NTSTATUS bluetooth_radio_dispatch( DEVICE_OBJECT *device, struct bluetoot
                                 irp->IoStatus.Information = sizeof(*params);
                             else
                                 irp->IoStatus.Information = 0;
+                            goto set_notify_done;
                         }
                         else
                             status = STATUS_INVALID_PARAMETER;
@@ -1700,6 +1701,7 @@ static NTSTATUS bluetooth_radio_dispatch( DEVICE_OBJECT *device, struct bluetoot
                 break;
         }
         LeaveCriticalSection( &device_list_cs );
+    set_notify_done:
         break;
     }
     default:
