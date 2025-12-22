@@ -2067,7 +2067,6 @@ static void bluetooth_radio_add_remote_device( struct winebluetooth_watcher_even
             else
                 list_add_tail( &radio->remote_devices, &ext->remote_device.entry );
 
-            ext->remote_device.state = BLUETOOTH_STATE_ACTIVE;
             radio_device_obj = radio->device_obj;
             break;
         }
