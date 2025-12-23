@@ -1978,41 +1978,20 @@ typedef enum __x_ABI_CWindows_CDevices_CBluetooth_CGenericAttributeProfile_CGatt
 #define IGattValueChangedEventArgs_Release __x_ABI_CWindows_CDevices_CBluetooth_CGenericAttributeProfile_CIGattValueChangedEventArgs_Release
 #define IGattValueChangedEventArgs_get_Timestamp __x_ABI_CWindows_CDevices_CBluetooth_CGenericAttributeProfile_CIGattValueChangedEventArgs_get_Timestamp
 #define IGattValueChangedEventArgs_get_CharacteristicValue __x_ABI_CWindows_CDevices_CBluetooth_CGenericAttributeProfile_CIGattValueChangedEventArgs_get_CharacteristicValue
-#define IGattSession __x_ABI_CWindows_CDevices_CBluetooth_CGenericAttributeProfile_CIGattSession
-#define IGattSessionVtbl __x_ABI_CWindows_CDevices_CBluetooth_CGenericAttributeProfile_CIGattSessionVtbl
 typedef enum __x_ABI_CWindows_CDevices_CBluetooth_CGenericAttributeProfile_CGattSharingMode GattSharingMode;
-typedef enum __x_ABI_CWindows_CDevices_CBluetooth_CGenericAttributeProfile_CGattOpenStatus GattOpenStatus;
+#define IGattSession __x_ABI_CWindows_CDevices_CBluetooth_CGenericAttributeProfile_CIGattSession
+#define IAsyncOperation_GattOpenStatus __FIAsyncOperation_1_GattOpenStatus
 #define IDeviceAccessInformation __x_ABI_CWindows_CDevices_CEnumeration_CIDeviceAccessInformation
 #define IDeviceAccessInformationVtbl __x_ABI_CWindows_CDevices_CEnumeration_CIDeviceAccessInformationVtbl
 #define IID_IDeviceAccessInformation IID___x_ABI_CWindows_CDevices_CEnumeration_CIDeviceAccessInformation
 #define IDeviceAccessInformation_AddRef __x_ABI_CWindows_CDevices_CEnumeration_CIDeviceAccessInformation_AddRef
 #define IDeviceAccessInformation_Release __x_ABI_CWindows_CDevices_CEnumeration_CIDeviceAccessInformation_Release
-#define IGattSession __x_ABI_CWindows_CDevices_CBluetooth_CGenericAttributeProfile_CIGattSession
-#define IGattSessionVtbl __x_ABI_CWindows_CDevices_CBluetooth_CGenericAttributeProfile_CIGattSessionVtbl
-#define IID_IGattSession IID___x_ABI_CWindows_CDevices_CBluetooth_CGenericAttributeProfile_CIGattSession
-#define IAsyncOperation_GattOpenStatus __FIAsyncOperation_1_GattOpenStatus
-#define IAsyncOperation_GattOpenStatusVtbl __FIAsyncOperation_1_GattOpenStatusVtbl
-#define IID_IAsyncOperation_GattOpenStatus IID___FIAsyncOperation_1_GattOpenStatus
 
 typedef enum __x_ABI_CWindows_CDevices_CEnumeration_CDeviceAccessStatus DeviceAccessStatus;
-typedef enum __x_ABI_CWindows_CDevices_CBluetooth_CGenericAttributeProfile_CGattOpenStatus GattOpenStatus;
-typedef enum __x_ABI_CWindows_CDevices_CBluetooth_CGenericAttributeProfile_CGattSessionStatus GattSessionStatus;
-typedef enum __x_ABI_CWindows_CDevices_CBluetooth_CGenericAttributeProfile_CGattSharingMode GattSharingMode;
-
-typedef interface __FITypedEventHandler_2_Windows__CDevices__CBluetooth__CGenericAttributeProfile__CGattSession_IInspectable gatt_session_max_pdu_handler;
-typedef interface __FITypedEventHandler_2_Windows__CDevices__CBluetooth__CGenericAttributeProfile__CGattSession_Windows__CDevices__CBluetooth__CGenericAttributeProfile__CGattSessionStatusChangedEventArgs gatt_session_status_handler;
-typedef interface __FIAsyncOperationCompletedHandler_1_GattOpenStatus async_gatt_open_handler;
 
 static const IAsyncOperation_DeviceAccessStatusVtbl async_device_access_op_vtbl;
 static const IAsyncInfoVtbl async_device_access_info_vtbl;
 static HRESULT async_device_access_op_create( DeviceAccessStatus status, IAsyncOperation_DeviceAccessStatus **operation );
-
-static const IGattSessionVtbl gatt_session_vtbl;
-static const IAsyncOperation_GattOpenStatusVtbl async_gatt_open_op_vtbl;
-static const IAsyncInfoVtbl async_gatt_open_info_vtbl;
-
-static HRESULT gatt_session_create( IGattSession **out );
-static HRESULT async_gatt_open_op_create( GattOpenStatus status, IAsyncOperation_GattOpenStatus **operation );
 
 static CRITICAL_SECTION timestamp_cs;
 static CRITICAL_SECTION_DEBUG timestamp_cs_debug =
@@ -4920,407 +4899,6 @@ static HRESULT async_gatt_comm_status_op_create( GattCommunicationStatus result,
     return S_OK;
 }
 
-/* Forward declarations */
-static const IGattSessionVtbl gatt_session_vtbl;
-static const IAsyncOperation_GattOpenStatusVtbl async_gatt_open_op_vtbl;
-static const IAsyncInfoVtbl async_gatt_open_info_vtbl;
-
-static HRESULT gatt_session_create( IGattSession **out );
-static HRESULT async_gatt_open_op_create( GattOpenStatus status, IAsyncOperation_GattOpenStatus **operation );
-
-/* IGattSession implementation */
-struct gatt_session
-{
-    IGattSession IGattSession_iface;
-    LONG ref;
-};
-
-static inline struct gatt_session *impl_from_IGattSession( IGattSession *iface )
-{
-    return CONTAINING_RECORD( iface, struct gatt_session, IGattSession_iface );
-}
-
-static HRESULT WINAPI gatt_session_QueryInterface( IGattSession *iface, REFIID iid, void **out )
-{
-    struct gatt_session *impl = impl_from_IGattSession( iface );
-    TRACE( "(%p, %s, %p)\n", iface, debugstr_guid( iid ), out );
-
-    if (IsEqualGUID( iid, &IID_IUnknown ) ||
-        IsEqualGUID( iid, &IID_IInspectable ) ||
-        IsEqualGUID( iid, &IID_IGattSession ))
-    {
-        *out = &impl->IGattSession_iface;
-        iface->lpVtbl->AddRef( iface );
-        return S_OK;
-    }
-
-    FIXME( "stub: iid=%s\n", debugstr_guid( iid ) );
-    *out = NULL;
-    return E_NOINTERFACE;
-}
-
-static ULONG WINAPI gatt_session_AddRef( IGattSession *iface )
-{
-    struct gatt_session *impl = impl_from_IGattSession( iface );
-    ULONG ref = InterlockedIncrement( &impl->ref );
-    TRACE( "(%p) -> %lu\n", iface, ref );
-    return ref;
-}
-
-static ULONG WINAPI gatt_session_Release( IGattSession *iface )
-{
-    struct gatt_session *impl = impl_from_IGattSession( iface );
-    ULONG ref = InterlockedDecrement( &impl->ref );
-    TRACE( "(%p) -> %lu\n", iface, ref );
-    if (!ref) free( impl );
-    return ref;
-}
-
-static HRESULT WINAPI gatt_session_GetIids( IGattSession *iface, ULONG *iid_count, IID **iids )
-{
-    FIXME( "(%p, %p, %p): stub!\n", iface, iid_count, iids );
-    return E_NOTIMPL;
-}
-
-static HRESULT WINAPI gatt_session_GetRuntimeClassName( IGattSession *iface, HSTRING *class_name )
-{
-    FIXME( "(%p, %p): stub!\n", iface, class_name );
-    return E_NOTIMPL;
-}
-
-static HRESULT WINAPI gatt_session_GetTrustLevel( IGattSession *iface, TrustLevel *level )
-{
-    FIXME( "(%p, %p): stub!\n", iface, level );
-    return E_NOTIMPL;
-}
-
-static HRESULT WINAPI gatt_session_get_DeviceId( IGattSession *iface, __x_ABI_CWindows_CDevices_CBluetooth_CIBluetoothDeviceId **value )
-{
-    FIXME( "(%p, %p): stub!\n", iface, value );
-    if (!value) return E_POINTER;
-    *value = NULL;
-    return S_OK;
-}
-
-static HRESULT WINAPI gatt_session_get_CanMaintainConnection( IGattSession *iface, boolean *value )
-{
-    FIXME( "(%p, %p): stub!\n", iface, value );
-    if (!value) return E_POINTER;
-    *value = TRUE;
-    return S_OK;
-}
-
-static HRESULT WINAPI gatt_session_put_MaintainConnection( IGattSession *iface, boolean value )
-{
-    FIXME( "(%p, %d): stub!\n", iface, value );
-    return S_OK;
-}
-
-static HRESULT WINAPI gatt_session_get_MaintainConnection( IGattSession *iface, boolean *value )
-{
-    FIXME( "(%p, %p): stub!\n", iface, value );
-    if (!value) return E_POINTER;
-    *value = TRUE;
-    return S_OK;
-}
-
-static HRESULT WINAPI gatt_session_get_MaxPduSize( IGattSession *iface, UINT16 *value )
-{
-    FIXME( "(%p, %p): stub!\n", iface, value );
-    if (!value) return E_POINTER;
-    *value = 23;
-    return S_OK;
-}
-
-static HRESULT WINAPI gatt_session_get_SessionStatus( IGattSession *iface, GattSessionStatus *value )
-{
-    FIXME( "(%p, %p): stub!\n", iface, value );
-    if (!value) return E_POINTER;
-    *value = 0; /* Active */
-    return S_OK;
-}
-
-static HRESULT WINAPI gatt_session_add_MaxPduSizeChanged( IGattSession *iface, gatt_session_max_pdu_handler *handler, EventRegistrationToken *token )
-{
-    FIXME( "(%p, %p, %p): stub!\n", iface, handler, token );
-    return S_OK;
-}
-
-static HRESULT WINAPI gatt_session_remove_MaxPduSizeChanged( IGattSession *iface, EventRegistrationToken token )
-{
-    FIXME( "(%p, %I64d): stub!\n", iface, token.value );
-    return S_OK;
-}
-
-static HRESULT WINAPI gatt_session_add_SessionStatusChanged( IGattSession *iface, gatt_session_status_handler *handler, EventRegistrationToken *token )
-{
-    FIXME( "(%p, %p, %p): stub!\n", iface, handler, token );
-    return S_OK;
-}
-
-static HRESULT WINAPI gatt_session_remove_SessionStatusChanged( IGattSession *iface, EventRegistrationToken token )
-{
-    FIXME( "(%p, %I64d): stub!\n", iface, token.value );
-    return S_OK;
-}
-
-static const IGattSessionVtbl gatt_session_vtbl =
-{
-    gatt_session_QueryInterface,
-    gatt_session_AddRef,
-    gatt_session_Release,
-    gatt_session_GetIids,
-    gatt_session_GetRuntimeClassName,
-    gatt_session_GetTrustLevel,
-    gatt_session_get_DeviceId,
-    gatt_session_get_CanMaintainConnection,
-    gatt_session_put_MaintainConnection,
-    gatt_session_get_MaintainConnection,
-    gatt_session_get_MaxPduSize,
-    gatt_session_get_SessionStatus,
-    gatt_session_add_MaxPduSizeChanged,
-    gatt_session_remove_MaxPduSizeChanged,
-    gatt_session_add_SessionStatusChanged,
-    gatt_session_remove_SessionStatusChanged,
-};
-
-static HRESULT gatt_session_create( IGattSession **out )
-{
-    struct gatt_session *impl;
-    if (!(impl = calloc( 1, sizeof( *impl ) ))) return E_OUTOFMEMORY;
-    impl->IGattSession_iface.lpVtbl = &gatt_session_vtbl;
-    impl->ref = 1;
-    *out = &impl->IGattSession_iface;
-    return S_OK;
-}
-
-/* IAsyncOperation_GattOpenStatus implementation */
-struct async_gatt_open_op
-{
-    IAsyncOperation_GattOpenStatus IAsyncOperation_GattOpenStatus_iface;
-    IAsyncInfo IAsyncInfo_iface;
-    LONG ref;
-    GattOpenStatus status;
-    async_gatt_open_handler *handler;
-};
-
-static inline struct async_gatt_open_op *impl_from_IAsyncOperation_GattOpenStatus( IAsyncOperation_GattOpenStatus *iface )
-{
-    return CONTAINING_RECORD( iface, struct async_gatt_open_op, IAsyncOperation_GattOpenStatus_iface );
-}
-
-static HRESULT WINAPI async_gatt_open_op_QueryInterface( IAsyncOperation_GattOpenStatus *iface, REFIID iid, void **out )
-{
-    struct async_gatt_open_op *impl = impl_from_IAsyncOperation_GattOpenStatus( iface );
-    TRACE( "(%p, %s, %p)\n", iface, debugstr_guid( iid ), out );
-
-    if (IsEqualGUID( iid, &IID_IUnknown ) ||
-        IsEqualGUID( iid, &IID_IInspectable ) ||
-        IsEqualGUID( iid, &IID_IAsyncOperation_GattOpenStatus ))
-    {
-        *out = &impl->IAsyncOperation_GattOpenStatus_iface;
-        IAsyncOperation_GattOpenStatus_AddRef( iface );
-        return S_OK;
-    }
-
-    if (IsEqualGUID( iid, &IID_IAsyncInfo ))
-    {
-        *out = &impl->IAsyncInfo_iface;
-        IAsyncOperation_GattOpenStatus_AddRef( iface );
-        return S_OK;
-    }
-
-    FIXME( "stub: iid=%s\n", debugstr_guid( iid ) );
-    *out = NULL;
-    return E_NOINTERFACE;
-}
-
-static ULONG WINAPI async_gatt_open_op_AddRef( IAsyncOperation_GattOpenStatus *iface )
-{
-    struct async_gatt_open_op *impl = impl_from_IAsyncOperation_GattOpenStatus( iface );
-    ULONG ref = InterlockedIncrement( &impl->ref );
-    TRACE( "(%p) -> %lu\n", iface, ref );
-    return ref;
-}
-
-static ULONG WINAPI async_gatt_open_op_Release( IAsyncOperation_GattOpenStatus *iface )
-{
-    struct async_gatt_open_op *impl = impl_from_IAsyncOperation_GattOpenStatus( iface );
-    ULONG ref = InterlockedDecrement( &impl->ref );
-    TRACE( "(%p) -> %lu\n", iface, ref );
-    if (!ref) free( impl );
-    return ref;
-}
-
-static HRESULT WINAPI async_gatt_open_op_GetIids( IAsyncOperation_GattOpenStatus *iface, ULONG *iid_count, IID **iids )
-{
-    FIXME( "stub\n" );
-    return E_NOTIMPL;
-}
-
-static HRESULT WINAPI async_gatt_open_op_GetRuntimeClassName( IAsyncOperation_GattOpenStatus *iface, HSTRING *class_name )
-{
-    FIXME( "stub\n" );
-    return E_NOTIMPL;
-}
-
-static HRESULT WINAPI async_gatt_open_op_GetTrustLevel( IAsyncOperation_GattOpenStatus *iface, TrustLevel *level )
-{
-    FIXME( "stub\n" );
-    return E_NOTIMPL;
-}
-
-static HRESULT WINAPI async_gatt_open_op_put_Completed( IAsyncOperation_GattOpenStatus *iface, async_gatt_open_handler *handler )
-{
-    struct async_gatt_open_op *impl = impl_from_IAsyncOperation_GattOpenStatus( iface );
-    TRACE( "(%p, %p) status=%d\n", iface, handler, impl->status );
-
-    if (!handler) return E_POINTER;
-    if (impl->handler) return E_ILLEGAL_DELEGATE_ASSIGNMENT;
-
-    ((IUnknown *)handler)->lpVtbl->AddRef( (IUnknown *)handler );
-    impl->handler = handler;
-
-    /* Invoke immediately as we are always COMPLETED at this point in the current stub implementation */
-    IAsyncOperationCompletedHandler_GattOpenStatus_Invoke( handler, iface, Completed );
-
-    return S_OK;
-}
-
-static HRESULT WINAPI async_gatt_open_op_get_Completed( IAsyncOperation_GattOpenStatus *iface, async_gatt_open_handler **handler )
-{
-    struct async_gatt_open_op *impl = impl_from_IAsyncOperation_GattOpenStatus( iface );
-    TRACE( "(%p, %p)\n", iface, handler );
-    if (!handler) return E_POINTER;
-    *handler = impl->handler;
-    if (*handler) ((IUnknown *)*handler)->lpVtbl->AddRef( (IUnknown *)*handler );
-    return S_OK;
-}
-
-static HRESULT WINAPI async_gatt_open_op_GetResults( IAsyncOperation_GattOpenStatus *iface, GattOpenStatus *results )
-{
-    struct async_gatt_open_op *impl = impl_from_IAsyncOperation_GattOpenStatus( iface );
-    TRACE( "(%p, %p)\n", iface, results );
-    if (!results) return E_POINTER;
-    *results = impl->status;
-    return S_OK;
-}
-
-static const IAsyncOperation_GattOpenStatusVtbl async_gatt_open_op_vtbl =
-{
-    async_gatt_open_op_QueryInterface,
-    async_gatt_open_op_AddRef,
-    async_gatt_open_op_Release,
-    async_gatt_open_op_GetIids,
-    async_gatt_open_op_GetRuntimeClassName,
-    async_gatt_open_op_GetTrustLevel,
-    async_gatt_open_op_put_Completed,
-    async_gatt_open_op_get_Completed,
-    async_gatt_open_op_GetResults,
-};
-
-static inline struct async_gatt_open_op *impl_from_IAsyncInfo_gatt_open( IAsyncInfo *iface )
-{
-    return CONTAINING_RECORD( iface, struct async_gatt_open_op, IAsyncInfo_iface );
-}
-
-static HRESULT WINAPI async_gatt_open_info_QueryInterface( IAsyncInfo *iface, REFIID iid, void **out )
-{
-    struct async_gatt_open_op *impl = impl_from_IAsyncInfo_gatt_open( iface );
-    return IAsyncOperation_GattOpenStatus_QueryInterface( &impl->IAsyncOperation_GattOpenStatus_iface, iid, out );
-}
-
-static ULONG WINAPI async_gatt_open_info_AddRef( IAsyncInfo *iface )
-{
-    struct async_gatt_open_op *impl = impl_from_IAsyncInfo_gatt_open( iface );
-    return IAsyncOperation_GattOpenStatus_AddRef( &impl->IAsyncOperation_GattOpenStatus_iface );
-}
-
-static ULONG WINAPI async_gatt_open_info_Release( IAsyncInfo *iface )
-{
-    struct async_gatt_open_op *impl = impl_from_IAsyncInfo_gatt_open( iface );
-    return IAsyncOperation_GattOpenStatus_Release( &impl->IAsyncOperation_GattOpenStatus_iface );
-}
-
-static HRESULT WINAPI async_gatt_open_info_get_Id( IAsyncInfo *iface, UINT32 *id )
-{
-    FIXME( "stub\n" );
-    return E_NOTIMPL;
-}
-
-static HRESULT WINAPI async_gatt_open_info_get_Status( IAsyncInfo *iface, AsyncStatus *status )
-{
-    TRACE( "(%p, %p)\n", iface, status );
-    if (!status) return E_POINTER;
-    *status = Completed;
-    return S_OK;
-}
-
-static HRESULT WINAPI async_gatt_open_info_get_ErrorCode( IAsyncInfo *iface, HRESULT *error_code )
-{
-    TRACE( "(%p, %p)\n", iface, error_code );
-    if (!error_code) return E_POINTER;
-    *error_code = S_OK;
-    return S_OK;
-}
-
-static HRESULT WINAPI async_gatt_open_info_Cancel( IAsyncInfo *iface )
-{
-    FIXME( "stub\n" );
-    return E_NOTIMPL;
-}
-
-static HRESULT WINAPI async_gatt_open_info_Close( IAsyncInfo *iface )
-{
-    FIXME( "stub\n" );
-    return E_NOTIMPL;
-}
-
-static HRESULT WINAPI async_gatt_open_info_GetIids( IAsyncInfo *iface, ULONG *iid_count, IID **iids )
-{
-    FIXME( "stub\n" );
-    return E_NOTIMPL;
-}
-
-static HRESULT WINAPI async_gatt_open_info_GetRuntimeClassName( IAsyncInfo *iface, HSTRING *class_name )
-{
-    FIXME( "stub\n" );
-    return E_NOTIMPL;
-}
-
-static HRESULT WINAPI async_gatt_open_info_GetTrustLevel( IAsyncInfo *iface, TrustLevel *level )
-{
-    FIXME( "stub\n" );
-    return E_NOTIMPL;
-}
-
-static const IAsyncInfoVtbl async_gatt_open_info_vtbl =
-{
-    async_gatt_open_info_QueryInterface,
-    async_gatt_open_info_AddRef,
-    async_gatt_open_info_Release,
-    async_gatt_open_info_GetIids,
-    async_gatt_open_info_GetRuntimeClassName,
-    async_gatt_open_info_GetTrustLevel,
-    async_gatt_open_info_get_Id,
-    async_gatt_open_info_get_Status,
-    async_gatt_open_info_get_ErrorCode,
-    async_gatt_open_info_Cancel,
-    async_gatt_open_info_Close,
-};
-
-static HRESULT async_gatt_open_op_create( GattOpenStatus status, IAsyncOperation_GattOpenStatus **operation )
-{
-    struct async_gatt_open_op *impl;
-    if (!(impl = calloc( 1, sizeof( *impl ) ))) return E_OUTOFMEMORY;
-    impl->IAsyncOperation_GattOpenStatus_iface.lpVtbl = &async_gatt_open_op_vtbl;
-    impl->IAsyncInfo_iface.lpVtbl = &async_gatt_open_info_vtbl;
-    impl->ref = 1;
-    impl->status = status;
-    *operation = &impl->IAsyncOperation_GattOpenStatus_iface;
-    return S_OK;
-}
-
 /* IGattDeviceService3 implementation */
 static inline struct gatt_device_service *impl_from_IGattDeviceService3( IGattDeviceService3 *iface )
 {
@@ -5373,9 +4951,10 @@ static HRESULT WINAPI gatt_service3_get_DeviceAccessInformation( IGattDeviceServ
 
 static HRESULT WINAPI gatt_service3_get_Session( IGattDeviceService3 *iface, IGattSession **value )
 {
-    TRACE( "(%p, %p)\n", iface, value );
+    FIXME( "(%p, %p): stub!\n", iface, value );
     if (!value) return E_POINTER;
-    return gatt_session_create( value );
+    *value = NULL;
+    return E_NOTIMPL;
 }
 
 static HRESULT WINAPI gatt_service3_get_SharingMode( IGattDeviceService3 *iface, GattSharingMode *value )
@@ -5396,8 +4975,10 @@ static HRESULT WINAPI gatt_service3_RequestAccessAsync( IGattDeviceService3 *ifa
 static HRESULT WINAPI gatt_service3_OpenAsync( IGattDeviceService3 *iface, GattSharingMode mode,
                                                 IAsyncOperation_GattOpenStatus **async )
 {
-    TRACE( "(%p, %d, %p)\n", iface, mode, async );
-    return async_gatt_open_op_create( GattOpenStatus_Success, async );
+    FIXME( "(%p, %d, %p): stub!\n", iface, mode, async );
+    if (!async) return E_POINTER;
+    *async = NULL;
+    return E_NOTIMPL;
 }
 
 static HRESULT get_characteristics_async_helper( IGattDeviceService3 *iface,

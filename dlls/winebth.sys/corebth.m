@@ -36,7 +36,7 @@
 #include <stdatomic.h>
 #include <string.h>
 #include <stdio.h>
-
+#include <time.h>
 
 struct corebth_context;
 struct corebth_peripheral_entry;
@@ -144,6 +144,13 @@ enum corebth_event_type
 {
     COREBTH_EVENT_WATCHER = 0,
     COREBTH_EVENT_AUTH,
+};
+
+enum corebth_object_state
+{
+    COREBTH_STATE_INITIALIZING = 0,
+    COREBTH_STATE_ACTIVE,
+    COREBTH_STATE_REMOVING,
 };
 
 typedef union {
@@ -283,6 +290,9 @@ struct corebth_event_entry
 struct corebth_peripheral_entry
 {
     struct corebth_peripheral_entry *next;
+    pthread_mutex_t mutex;
+    int ref_count;
+    enum corebth_object_state state;
     CBPeripheral *peripheral;
     struct unix_name *name;
     uintptr_t handle;
@@ -305,6 +315,9 @@ struct corebth_service_entry
 {
     struct corebth_service_entry *next;
     struct corebth_service_entry *next_global;
+    pthread_mutex_t mutex;
+    int ref_count;
+    enum corebth_object_state state;
     struct corebth_peripheral_entry *peripheral;
     CBService *service;
     struct unix_name *path;
@@ -331,6 +344,7 @@ struct corebth_char_entry
 {
     struct corebth_char_entry *next;
     struct corebth_char_entry *next_global;
+    pthread_mutex_t mutex;
     struct corebth_service_entry *service;
     CBCharacteristic *characteristic;
     struct unix_name *path;
@@ -351,7 +365,6 @@ struct corebth_char_entry
     uint32_t write_completed_gen;
     BOOL notifications_enabled;
     BOOL read_awaiting_response;  /* Set on bt_queue right before readValueForCharacteristic */
-    pthread_mutex_t notification_mutex;
     dispatch_semaphore_t notification_semaphore;
     struct corebth_notification_entry *notification_queue_head;
     struct corebth_notification_entry *notification_queue_tail;
@@ -371,12 +384,10 @@ struct corebth_context
     struct corebth_event_entry *event_head;
     struct corebth_event_entry *event_tail;
 
-    pthread_mutex_t peripheral_mutex;
+    pthread_mutex_t list_mutex;
     struct corebth_peripheral_entry *peripherals;
     struct corebth_peripheral_map uuid_map;
     uintptr_t next_peripheral_handle;
-
-    pthread_mutex_t service_list_mutex;
     struct corebth_service_entry *services;
     struct corebth_char_entry *characteristics;
 
@@ -417,6 +428,62 @@ static inline void char_set_invalidated(struct corebth_char_entry *ch)
 static inline BOOL char_is_invalidated(struct corebth_char_entry *ch)
 {
     return atomic_load_explicit(&ch->invalidated, memory_order_acquire);
+}
+
+static NTSTATUS corebluetooth_error_to_ntstatus(NSError *error)
+{
+    if (!error)
+        return STATUS_SUCCESS;
+
+    if ([error.domain isEqualToString:CBErrorDomain])
+    {
+        switch (error.code)
+        {
+            case CBErrorUnknown:                    return STATUS_UNSUCCESSFUL;
+            case CBErrorInvalidParameters:          return STATUS_INVALID_PARAMETER;
+            case CBErrorInvalidHandle:              return STATUS_INVALID_HANDLE;
+            case CBErrorNotConnected:               return STATUS_DEVICE_NOT_CONNECTED;
+            case CBErrorOutOfSpace:                 return STATUS_INSUFFICIENT_RESOURCES;
+            case CBErrorOperationCancelled:         return STATUS_CANCELLED;
+            case CBErrorConnectionTimeout:          return STATUS_IO_TIMEOUT;
+            case CBErrorPeripheralDisconnected:     return STATUS_DEVICE_NOT_CONNECTED;
+            case CBErrorUUIDNotAllowed:             return STATUS_ACCESS_DENIED;
+            case CBErrorAlreadyAdvertising:         return STATUS_ALREADY_COMMITTED;
+            case CBErrorConnectionFailed:           return STATUS_CONNECTION_REFUSED;
+            case CBErrorConnectionLimitReached:     return STATUS_CONNECTION_COUNT_LIMIT;
+            case CBErrorUnknownDevice:              return STATUS_DEVICE_NOT_CONNECTED;
+            case CBErrorOperationNotSupported:      return STATUS_NOT_SUPPORTED;
+            case CBErrorPeerRemovedPairingInformation: return STATUS_TRUST_FAILURE;
+            case CBErrorEncryptionTimedOut:         return STATUS_ENCRYPTION_FAILED;
+            case CBErrorTooManyLEPairedDevices:     return STATUS_CONNECTION_COUNT_LIMIT;
+        }
+    }
+    else if ([error.domain isEqualToString:CBATTErrorDomain])
+    {
+        switch (error.code)
+        {
+            case CBATTErrorSuccess:                 return STATUS_SUCCESS;
+            case CBATTErrorInvalidHandle:           return STATUS_INVALID_HANDLE;
+            case CBATTErrorReadNotPermitted:        return STATUS_ACCESS_DENIED;
+            case CBATTErrorWriteNotPermitted:       return STATUS_ACCESS_DENIED;
+            case CBATTErrorInvalidPdu:              return STATUS_INVALID_PARAMETER;
+            case CBATTErrorInsufficientAuthentication: return STATUS_ACCESS_DENIED;
+            case CBATTErrorRequestNotSupported:     return STATUS_NOT_SUPPORTED;
+            case CBATTErrorInvalidOffset:           return STATUS_INVALID_PARAMETER;
+            case CBATTErrorInsufficientAuthorization: return STATUS_ACCESS_DENIED;
+            case CBATTErrorPrepareQueueFull:        return STATUS_INSUFFICIENT_RESOURCES;
+            case CBATTErrorAttributeNotFound:       return STATUS_NOT_FOUND;
+            case CBATTErrorAttributeNotLong:        return STATUS_INVALID_PARAMETER;
+            case CBATTErrorInsufficientEncryptionKeySize: return STATUS_ACCESS_DENIED;
+            case CBATTErrorInvalidAttributeValueLength: return STATUS_INVALID_PARAMETER;
+            case CBATTErrorUnlikelyError:           return STATUS_UNSUCCESSFUL;
+            case CBATTErrorInsufficientEncryption:  return STATUS_ACCESS_DENIED;
+            case CBATTErrorUnsupportedGroupType:    return STATUS_NOT_SUPPORTED;
+            case CBATTErrorInsufficientResources:   return STATUS_INSUFFICIENT_RESOURCES;
+        }
+    }
+
+    return STATUS_UNSUCCESSFUL;
 }
 
 static struct corebth_context *global_context;
@@ -593,6 +660,9 @@ static struct corebth_peripheral_entry *corebth_add_peripheral(struct corebth_co
     entry = calloc(1, sizeof(*entry));
     if (!entry) return NULL;
 
+    entry->ref_count = 1;
+    pthread_mutex_init( &entry->mutex, NULL );
+    entry->state = COREBTH_STATE_INITIALIZING;
     entry->peripheral = (CBPeripheral *)CFBridgingRetain(peripheral);
     entry->next_service_handle = 1;
     entry->services_discovered = dispatch_semaphore_create(0);
@@ -617,6 +687,7 @@ static struct corebth_peripheral_entry *corebth_add_peripheral(struct corebth_co
     entry->next = ctx->peripherals;
     ctx->peripherals = entry;
     corebth_peripheral_map_insert(&ctx->uuid_map, entry);
+    entry->state = COREBTH_STATE_ACTIVE;
 
     return entry;
 }
@@ -823,7 +894,7 @@ static void corebth_free_char(struct corebth_char_entry *ch)
     if (ch->pending_read) dispatch_release(ch->pending_read);
     if (ch->pending_write) dispatch_release(ch->pending_write);
     if (ch->notification_semaphore) dispatch_release(ch->notification_semaphore);
-    pthread_mutex_destroy(&ch->notification_mutex);
+    pthread_mutex_destroy(&ch->mutex);
 
     struct corebth_notification_entry *n = ch->notification_queue_head;
     while (n) {
@@ -849,6 +920,51 @@ static void corebth_char_release(struct corebth_char_entry *ch)
     }
 }
 
+static void corebth_free_service(struct corebth_service_entry *svc)
+{
+    if (svc->path) unix_name_free(svc->path);
+    if (svc->service) CFBridgingRelease(svc->service);
+    pthread_mutex_destroy(&svc->mutex);
+    free(svc);
+}
+
+static void corebth_service_retain(struct corebth_service_entry *svc)
+{
+    __sync_fetch_and_add(&svc->ref_count, 1);
+}
+
+static void corebth_service_release(struct corebth_service_entry *svc)
+{
+    if (__sync_sub_and_fetch(&svc->ref_count, 1) == 0) {
+        corebth_free_service(svc);
+    }
+}
+
+static void corebth_free_peripheral(struct corebth_peripheral_entry *periph)
+{
+    if (periph->peripheral)
+        CFBridgingRelease(periph->peripheral);
+    if (periph->peripheral_delegate)
+        CFRelease(periph->peripheral_delegate);
+    if (periph->services_discovered)
+        dispatch_release(periph->services_discovered);
+    if (periph->name) unix_name_free(periph->name);
+    pthread_mutex_destroy(&periph->mutex);
+    free(periph);
+}
+
+static void corebth_peripheral_retain(struct corebth_peripheral_entry *periph)
+{
+    __sync_fetch_and_add(&periph->ref_count, 1);
+}
+
+static void corebth_peripheral_release(struct corebth_peripheral_entry *periph)
+{
+    if (__sync_sub_and_fetch(&periph->ref_count, 1) == 0) {
+        corebth_free_peripheral(periph);
+    }
+}
+
 static struct corebth_service_entry *corebth_create_service_entry(struct corebth_peripheral_entry *periph,
                                                                    CBService *service,
                                                                    uint16_t attr_handle)
@@ -860,6 +976,9 @@ static struct corebth_service_entry *corebth_create_service_entry(struct corebth
     if (!entry)
         return NULL;
 
+    entry->ref_count = 1;
+    pthread_mutex_init( &entry->mutex, NULL );
+    entry->state = COREBTH_STATE_INITIALIZING;
     entry->peripheral = periph;
     entry->service = (CBService *)CFBridgingRetain(service);
     entry->attr_handle = attr_handle;
@@ -892,6 +1011,7 @@ static void corebth_link_service_entry(struct corebth_context *ctx,
     periph->services = entry;
     entry->next_global = ctx->services;
     ctx->services = entry;
+    entry->state = COREBTH_STATE_ACTIVE;
 }
 
 static void corebth_queue_service_removed(struct corebth_context *ctx, struct corebth_service_entry *svc)
@@ -994,6 +1114,7 @@ static struct corebth_char_entry *corebth_add_char(struct corebth_context *ctx,
     if (!entry) return NULL;
 
     entry->service = svc;
+    pthread_mutex_init( &entry->mutex, NULL );
     entry->characteristic = (CBCharacteristic *)CFBridgingRetain(characteristic);
     entry->pending_read = dispatch_semaphore_create(0);
     entry->pending_write = dispatch_semaphore_create(0);
@@ -1002,13 +1123,13 @@ static struct corebth_char_entry *corebth_add_char(struct corebth_context *ctx,
     atomic_store_explicit(&entry->invalidated, NO, memory_order_release);
     entry->notifications_enabled = FALSE;
     entry->read_awaiting_response = NO;
-    pthread_mutex_init(&entry->notification_mutex, NULL);
     entry->notification_semaphore = dispatch_semaphore_create(0);
     entry->notification_queue_head = NULL;
     entry->notification_queue_tail = NULL;
     entry->ref_count = 1;
 
-    uint16_t char_handle = svc->next_char_handle++;
+    uint16_t char_handle;
+    char_handle = svc->next_char_handle++;
     corebth_fill_props_from_cbcharacteristic(characteristic, &entry->props, svc->attr_handle, char_handle);
 
     snprintf(path, sizeof(path), "%s/char/%u", svc->path->str, char_handle);
@@ -1046,9 +1167,11 @@ static void corebth_queue_device_added(struct corebth_context *ctx,
 
     localName = advertisementData[CBAdvertisementDataLocalNameKey];
 
-    pthread_mutex_lock(&ctx->peripheral_mutex);
+    pthread_mutex_lock(&ctx->list_mutex);
     entry = corebth_find_peripheral(ctx, uuid_str);
     if (entry) {
+        corebth_peripheral_retain(entry);
+        pthread_mutex_lock(&entry->mutex);
         if (localName && entry->has_local_name == 0) {
             /* Got LocalName for existing device - update name */
             strncpy(entry->friendly_name, [localName UTF8String], BLUETOOTH_MAX_NAME_SIZE - 1);
@@ -1064,13 +1187,14 @@ static void corebth_queue_device_added(struct corebth_context *ctx,
                 props_changed->changed_props_mask = WINEBLUETOOTH_DEVICE_PROPERTY_NAME;
                 props_changed->invalid_props_mask = 0;
                 strncpy(props_changed->props.name, entry->friendly_name, BLUETOOTH_MAX_NAME_SIZE - 1);
-    corebth_uuid_to_address(entry->uuid_string, &props_changed->props.address);
-    props_changed->device.handle = entry->handle;
+                corebth_uuid_to_address(entry->uuid_string, &props_changed->props.address);
+                props_changed->device.handle = entry->handle;
 
-    pthread_mutex_unlock(&ctx->peripheral_mutex);
-    corebth_queue_event(ctx, &props_event);
+                pthread_mutex_unlock(&entry->mutex);
+                pthread_mutex_unlock(&ctx->list_mutex);
+                corebth_queue_event(ctx, &props_event);
             } else {
-
+                /* Device exists but hasn't been reported yet - send device_added now */
                 memset(&event, 0, sizeof(event));
                 event.event_type = COREBTH_EVENT_DEVICE_ADDED;
                 device_added->known_props_mask = WINEBLUETOOTH_DEVICE_ALL_PROPERTIES;
@@ -1081,45 +1205,37 @@ static void corebth_queue_device_added(struct corebth_context *ctx,
                 device_added->props.legacy_pairing = 0;
                 device_added->props.trusted = 0;
                 device_added->props.device_class = 0;
-                /* Duplicate unix_name references so winebth.sys takes ownership */
-                device_added->device.handle = (uintptr_t)unix_name_dup(entry->name);
+                device_added->device.handle = entry->handle;
                 device_added->radio.handle = ctx->radio_handle;
                 device_added->init_entry = 0;
+                entry->device_added = 1;
 
-                goto send_device_added;
+                pthread_mutex_unlock(&entry->mutex);
+                pthread_mutex_unlock(&ctx->list_mutex);
+                corebth_peripheral_release(entry);
+                corebth_queue_event(ctx, &event);
+                return;
             }
-            return;
+        } else {
+            pthread_mutex_unlock(&entry->mutex);
+            pthread_mutex_unlock(&ctx->list_mutex);
         }
-        pthread_mutex_unlock(&ctx->peripheral_mutex);
+        corebth_peripheral_release(entry);
         return;
     }
 
-    BOOL is_cached_name = NO;
     if (localName) {
         name = [localName UTF8String];
     } else if (peripheral.name) {
-        const char *pname = [peripheral.name UTF8String];
-        if (strncmp(pname, "BlueZ ", 6) == 0) {
-            is_cached_name = YES;
-            name = "";
-        } else {
-            name = pname;
-        }
+        name = [peripheral.name UTF8String];
     } else {
-        name = NULL;
-    }
-
-    if (!name || !name[0]) {
-        name = "";
-    } else if (strcmp(name, "BLE Device") == 0) {
         name = "";
     }
 
     entry = corebth_add_peripheral(ctx, peripheral, uuid_str);
-
     if (!entry)
     {
-        pthread_mutex_unlock(&ctx->peripheral_mutex);
+        pthread_mutex_unlock(&ctx->list_mutex);
         return;
     }
 
@@ -1137,11 +1253,8 @@ static void corebth_queue_device_added(struct corebth_context *ctx,
 
     memset(&event, 0, sizeof(event));
     event.event_type = COREBTH_EVENT_DEVICE_ADDED;
-
     device_added->known_props_mask = WINEBLUETOOTH_DEVICE_ALL_PROPERTIES;
-
     corebth_uuid_to_address(uuid_str, &device_added->props.address);
-
     strncpy(entry->friendly_name, name, BLUETOOTH_MAX_NAME_SIZE - 1);
     strncpy(device_added->props.name, name, BLUETOOTH_MAX_NAME_SIZE - 1);
 
@@ -1156,21 +1269,10 @@ static void corebth_queue_device_added(struct corebth_context *ctx,
     device_added->radio.handle = ctx->radio_handle;
     device_added->init_entry = 0;
 
-    if (is_cached_name) {
-        pthread_mutex_unlock(&ctx->peripheral_mutex);
-        return;
-    }
-
-send_device_added:
     entry->device_added = 1;
-
-    pthread_mutex_unlock(&ctx->peripheral_mutex);
+    pthread_mutex_unlock(&ctx->list_mutex);
 
     corebth_queue_event(ctx, &event);
-
-    /* DO NOT connect automatically here - we hit connection limits.
-     * Connection should be triggered on-demand when GATT services are requested
-     * via corebth_device_start_pairing(). */
 }
 
 @interface WineBluetoothDelegate : NSObject <CBCentralManagerDelegate>
@@ -1202,8 +1304,7 @@ send_device_added:
      advertisementData:(NSDictionary<NSString *,id> *)advertisementData
                   RSSI:(NSNumber *)RSSI
 {
-    /* Comment out noisy log - fires for every BLE device in range repeatedly */
-    /* NSLog(@"Wine: discovered peripheral: %@ name: %@", [peripheral.identifier UUIDString], peripheral.name); */
+    NSLog(@"Wine: discovered peripheral: %@ name: %@ adv: %@", [peripheral.identifier UUIDString], peripheral.name, advertisementData);
 
     if (self.ctx && self.ctx->discovering) {
         corebth_queue_device_added(self.ctx, peripheral, advertisementData, RSSI);
@@ -1216,12 +1317,16 @@ send_device_added:
     struct corebth_watcher_event props_event;
     struct corebth_device_props_changed_event *props_changed = &props_event.data.device_props_changed;
 
-
+    NSLog(@"Wine: didConnectPeripheral FIRED for %@", [peripheral.identifier UUIDString]);
 
     if (self.ctx) {
-        pthread_mutex_lock(&self.ctx->peripheral_mutex);
+        pthread_mutex_lock(&self.ctx->list_mutex);
         entry = corebth_find_peripheral_by_object(self.ctx, peripheral);
         if (entry) {
+            corebth_peripheral_retain(entry);
+            pthread_mutex_lock(&entry->mutex);
+            pthread_mutex_unlock(&self.ctx->list_mutex);
+
             memset(&props_event, 0, sizeof(props_event));
             props_event.event_type = COREBTH_EVENT_DEVICE_PROPS_CHANGED;
             props_changed->changed_props_mask = WINEBLUETOOTH_DEVICE_PROPERTY_CONNECTED;
@@ -1229,11 +1334,12 @@ send_device_added:
             props_changed->props.connected = 1;
             corebth_uuid_to_address(entry->uuid_string, &props_changed->props.address);
             props_changed->device.handle = entry->handle;
-            pthread_mutex_unlock(&self.ctx->peripheral_mutex);
 
+            pthread_mutex_unlock(&entry->mutex);
             corebth_queue_event(self.ctx, &props_event);
+            corebth_peripheral_release(entry);
         } else {
-            pthread_mutex_unlock(&self.ctx->peripheral_mutex);
+            pthread_mutex_unlock(&self.ctx->list_mutex);
         }
     }
 
@@ -1242,44 +1348,54 @@ send_device_added:
 
 - (void)centralManager:(CBCentralManager *)central didDisconnectPeripheral:(CBPeripheral *)peripheral error:(NSError *)error
 {
-    struct corebth_peripheral_entry *entry;
+    struct corebth_peripheral_entry *entry = NULL;
     struct corebth_watcher_event props_event;
     struct corebth_device_props_changed_event *props_changed = &props_event.data.device_props_changed;
+    BOOL was_discovering = FALSE;
+    UINT64 entry_handle = 0;
+    char uuid_string[64] = {0};
 
-    if (self.ctx) {
-        pthread_mutex_lock(&self.ctx->peripheral_mutex);
-        entry = corebth_find_peripheral_by_object(self.ctx, peripheral);
-        if (entry) {
-            BOOL was_discovering = (entry->pending_char_discovery_count > 0);
-            entry->char_discovery_started = 0;
-            entry->services_discovery_complete = 0;
-            entry->pending_char_discovery_count = 0;
-            entry->next_service_handle = 1;
+    if (!self.ctx) return;
 
-            if (was_discovering) {
-
-                dispatch_semaphore_signal(entry->services_discovered);
-            }
-
-            pthread_mutex_lock(&self.ctx->service_list_mutex);
-            corebth_invalidate_peripheral_chars(entry);
-            corebth_clear_peripheral_services(self.ctx, entry);
-            pthread_mutex_unlock(&self.ctx->service_list_mutex);
-
-            memset(&props_event, 0, sizeof(props_event));
-            props_event.event_type = COREBTH_EVENT_DEVICE_PROPS_CHANGED;
-            props_changed->changed_props_mask = WINEBLUETOOTH_DEVICE_PROPERTY_CONNECTED;
-            props_changed->invalid_props_mask = 0;
-            props_changed->props.connected = 0;
-            corebth_uuid_to_address(entry->uuid_string, &props_changed->props.address);
-            props_changed->device.handle = entry->handle;
-            pthread_mutex_unlock(&self.ctx->peripheral_mutex);
-
-            corebth_queue_event(self.ctx, &props_event);
-        } else {
-            pthread_mutex_unlock(&self.ctx->peripheral_mutex);
-        }
+    pthread_mutex_lock(&self.ctx->list_mutex);
+    entry = corebth_find_peripheral_by_object(self.ctx, peripheral);
+    if (entry) {
+        corebth_peripheral_retain(entry);
+        pthread_mutex_lock(&entry->mutex);
+        was_discovering = (entry->pending_char_discovery_count > 0);
+        entry->char_discovery_started = 0;
+        entry->services_discovery_complete = 0;
+        entry->pending_char_discovery_count = 0;
+        entry->next_service_handle = 1;
+        entry_handle = entry->handle;
+        strncpy(uuid_string, entry->uuid_string, sizeof(uuid_string) - 1);
+        pthread_mutex_unlock(&entry->mutex);
     }
+    pthread_mutex_unlock(&self.ctx->list_mutex);
+
+    if (!entry) return;
+
+    if (was_discovering) {
+        dispatch_semaphore_signal(entry->services_discovered);
+    }
+
+    pthread_mutex_lock(&self.ctx->list_mutex);
+    pthread_mutex_lock(&entry->mutex);
+    corebth_invalidate_peripheral_chars(entry);
+    corebth_clear_peripheral_services(self.ctx, entry);
+    pthread_mutex_unlock(&entry->mutex);
+    pthread_mutex_unlock(&self.ctx->list_mutex);
+
+    memset(&props_event, 0, sizeof(props_event));
+    props_event.event_type = COREBTH_EVENT_DEVICE_PROPS_CHANGED;
+    props_changed->changed_props_mask = WINEBLUETOOTH_DEVICE_PROPERTY_CONNECTED;
+    props_changed->invalid_props_mask = 0;
+    props_changed->props.connected = 0;
+    corebth_uuid_to_address(uuid_string, &props_changed->props.address);
+    props_changed->device.handle = entry_handle;
+
+    corebth_queue_event(self.ctx, &props_event);
+    corebth_peripheral_release(entry);
 }
 
 - (void)centralManager:(CBCentralManager *)central didFailToConnectPeripheral:(CBPeripheral *)peripheral error:(NSError *)error
@@ -1287,13 +1403,13 @@ send_device_added:
     struct corebth_peripheral_entry *entry;
 
     if (self.ctx) {
-        pthread_mutex_lock(&self.ctx->peripheral_mutex);
+        pthread_mutex_lock(&self.ctx->list_mutex);
         entry = corebth_find_peripheral_by_object(self.ctx, peripheral);
         if (entry) {
 
             dispatch_semaphore_signal(entry->services_discovered);
         }
-        pthread_mutex_unlock(&self.ctx->peripheral_mutex);
+        pthread_mutex_unlock(&self.ctx->list_mutex);
     }
 }
 
@@ -1322,6 +1438,7 @@ send_device_added:
         new_entries = calloc(count, sizeof(*new_entries));
         if (!new_entries) goto done;
 
+        pthread_mutex_lock(&self.periph->mutex);
         uint16_t next_handle = self.periph->next_service_handle;
         for (CBService *service in peripheral.services)
         {
@@ -1330,9 +1447,10 @@ send_device_added:
                 new_entries[new_count++] = entry;
         }
         self.periph->next_service_handle = next_handle;
+        pthread_mutex_unlock(&self.periph->mutex);
     }
 
-    pthread_mutex_lock(&self.ctx->service_list_mutex);
+    pthread_mutex_lock(&self.ctx->list_mutex);
 
     for (NSUInteger i = 0; i < new_count; i++)
     {
@@ -1349,27 +1467,33 @@ send_device_added:
         }
     }
 
-    pthread_mutex_unlock(&self.ctx->service_list_mutex);
+    pthread_mutex_unlock(&self.ctx->list_mutex);
 
     if (!self.periph->char_discovery_started) {
         self.periph->char_discovery_started = 1;
         NSUInteger service_count = [peripheral.services count];
         self.periph->pending_char_discovery_count = (int)service_count;
 
-
+        NSLog(@"didDiscoverServices: Starting char discovery for %lu services", (unsigned long)service_count);
 
         if (service_count == 0) {
             self.periph->services_discovery_complete = 1;
             dispatch_semaphore_signal(self.periph->services_discovered);
         } else {
             for (CBService *service in peripheral.services) {
+                NSLog(@"didDiscoverServices: Calling discoverCharacteristics for service %@", service.UUID);
                 @try {
                     [peripheral discoverCharacteristics:nil forService:service];
+                    NSLog(@"didDiscoverServices: discoverCharacteristics returned for service %@", service.UUID);
                 }
                 @catch (NSException *exception) {
+                    NSLog(@"didDiscoverServices: EXCEPTION calling discoverCharacteristics: %@", exception);
                 }
             }
+            NSLog(@"didDiscoverServices: All discoverCharacteristics calls dispatched");
         }
+    } else {
+        NSLog(@"didDiscoverServices: char_discovery_started already true, skipping");
     }
 
 done:
@@ -1378,10 +1502,14 @@ done:
 
 - (void)peripheral:(CBPeripheral *)peripheral didDiscoverCharacteristicsForService:(CBService *)service error:(NSError *)error
 {
+    NSLog(@"didDiscoverCharacteristicsForService FIRED: service=%@ error=%@ charCount=%lu",
+          service.UUID, error ? [error description] : @"nil",
+          (unsigned long)[service.characteristics count]);
+
     if (!self.ctx || !self.periph)
         return;
 
-    pthread_mutex_lock(&self.ctx->service_list_mutex);
+    pthread_mutex_lock(&self.ctx->list_mutex);
     struct corebth_service_entry *svc = corebth_find_service_by_cb(self.ctx, service);
     if (svc)
     {
@@ -1400,12 +1528,14 @@ done:
     {
 
     }
-    pthread_mutex_unlock(&self.ctx->service_list_mutex);
+    pthread_mutex_unlock(&self.ctx->list_mutex);
 
     if (self.periph) {
         int remaining = __sync_sub_and_fetch(&self.periph->pending_char_discovery_count, 1);
         if (remaining == 0) {
+            pthread_mutex_lock(&self.periph->mutex);
             self.periph->services_discovery_complete = 1;
+            pthread_mutex_unlock(&self.periph->mutex);
 
             dispatch_semaphore_signal(self.periph->services_discovered);
         }
@@ -1414,35 +1544,43 @@ done:
 
 - (void)peripheral:(CBPeripheral *)peripheral didUpdateValueForCharacteristic:(CBCharacteristic *)characteristic error:(NSError *)error
 {
-    NSLog(@"didUpdateValueForCharacteristic FIRED: char=%p uuid=%@ error=%@",
+    CFAbsoluteTime callback_time = CFAbsoluteTimeGetCurrent();
+    NSLog(@"didUpdateValueForCharacteristic FIRED at %.3f: char=%p uuid=%@ error=%@ data_len=%lu",
+        callback_time,
         characteristic,
         [characteristic.UUID UUIDString],
-        error ? [error description] : @"nil");
+        error ? [error description] : @"nil",
+        (unsigned long)(characteristic.value ? characteristic.value.length : 0));
 
     if (!self.ctx) {
         NSLog(@"didUpdateValueForCharacteristic: self.ctx is nil!");
         return;
     }
 
-    pthread_mutex_lock(&self.ctx->service_list_mutex);
+    pthread_mutex_lock(&self.ctx->list_mutex);
     struct corebth_char_entry *ch = corebth_find_char_by_cb(self.ctx, characteristic);
     if (!ch) {
-        pthread_mutex_unlock(&self.ctx->service_list_mutex);
+        pthread_mutex_unlock(&self.ctx->list_mutex);
         NSLog(@"didUpdateValueForCharacteristic: corebth_find_char_by_cb returned NULL for char=%p", characteristic);
         return;
     }
     corebth_char_retain(ch);
+    pthread_mutex_lock(&ch->mutex);
+    pthread_mutex_unlock(&self.ctx->list_mutex);
+
     NSLog(@"didUpdateValueForCharacteristic: found ch=%p read_awaiting_response=%d", ch, ch->read_awaiting_response);
 
     if (char_is_invalidated(ch)) {
-        pthread_mutex_unlock(&self.ctx->service_list_mutex);
-
+        pthread_mutex_unlock(&ch->mutex);
         corebth_char_release(ch);
         return;
     }
 
     uint32_t current_gen = ch->read_generation;
     BOOL is_read_response = ch->read_awaiting_response;
+    BOOL notifications_enabled_local = ch->notifications_enabled;
+    dispatch_semaphore_t read_sem = ch->pending_read;
+    dispatch_semaphore_t notif_sem = ch->notification_semaphore;
 
     /* CRITICAL: Check read_awaiting_response first. This flag is set ON bt_queue
      * right before readValueForCharacteristic is called. Since bt_queue is serial,
@@ -1451,12 +1589,10 @@ done:
      * arriving during a pending read was incorrectly processed as the read response. */
     if (is_read_response)
     {
-        /* Clear the flag immediately - we're handling the read response now */
         ch->read_awaiting_response = NO;
 
         NSData *data = characteristic.value;
         if (error || !data) {
-
             char_set_read_status(ch, COREBTH_INTERNAL_ERROR);
             ch->pending_read_actual_len = 0;
         } else {
@@ -1467,12 +1603,22 @@ done:
             }
             ch->pending_read_actual_len = to_copy;
             char_set_read_status(ch, COREBTH_SUCCESS);
+
+            free(ch->cached_value);
+            ch->cached_value = malloc((unsigned int)data.length);
+            if (ch->cached_value) {
+                memcpy(ch->cached_value, data.bytes, data.length);
+                ch->cached_value_len = (unsigned int)data.length;
+                ch->cached_value_valid = TRUE;
+            }
         }
         ch->read_completed_gen = current_gen;
-        dispatch_semaphore_signal(ch->pending_read);
+        pthread_mutex_unlock(&ch->mutex);
+        dispatch_semaphore_signal(read_sem);
     }
-    else if (ch->notifications_enabled && !error)
+    else if (notifications_enabled_local && !error)
     {
+        pthread_mutex_unlock(&ch->mutex);
 
         NSData *data = characteristic.value;
         struct corebth_notification_entry *notif_entry = calloc(1, sizeof(*notif_entry));
@@ -1483,25 +1629,20 @@ done:
                 memcpy(notif_entry->data, data.bytes, notif_entry->data_len);
                 notif_entry->next = NULL;
 
-
-                pthread_mutex_lock(&ch->notification_mutex);
-
+                pthread_mutex_lock(&ch->mutex);
                 if (ch->notification_queue_tail) {
                     ch->notification_queue_tail->next = notif_entry;
                 } else {
                     ch->notification_queue_head = notif_entry;
                 }
                 ch->notification_queue_tail = notif_entry;
-                pthread_mutex_unlock(&ch->notification_mutex);
+                pthread_mutex_unlock(&ch->mutex);
 
-
-                dispatch_semaphore_signal(ch->notification_semaphore);
-
+                dispatch_semaphore_signal(notif_sem);
             } else {
                 free(notif_entry);
             }
         }
-
     }
     else if (!error)
     {
@@ -1515,10 +1656,12 @@ done:
                 ch->cached_value_valid = TRUE;
             }
         }
+        pthread_mutex_unlock(&ch->mutex);
     }
-
-
-    pthread_mutex_unlock(&self.ctx->service_list_mutex);
+    else
+    {
+        pthread_mutex_unlock(&ch->mutex);
+    }
 
     corebth_char_release(ch);
 }
@@ -1528,19 +1671,24 @@ done:
     if (!self.ctx)
         return;
 
-    pthread_mutex_lock(&self.ctx->service_list_mutex);
+    pthread_mutex_lock(&self.ctx->list_mutex);
     struct corebth_char_entry *ch = corebth_find_char_by_cb(self.ctx, characteristic);
     if (!ch) {
-        pthread_mutex_unlock(&self.ctx->service_list_mutex);
+        pthread_mutex_unlock(&self.ctx->list_mutex);
         return;
     }
     corebth_char_retain(ch);
+    pthread_mutex_lock(&ch->mutex);
+    pthread_mutex_unlock(&self.ctx->list_mutex);
 
     if (char_is_invalidated(ch)) {
-        pthread_mutex_unlock(&self.ctx->service_list_mutex);
+        pthread_mutex_unlock(&ch->mutex);
         corebth_char_release(ch);
         return;
     }
+
+    dispatch_semaphore_t write_sem = ch->pending_write;
+    BOOL should_signal = NO;
 
     if (char_get_write_status(ch) == COREBTH_PENDING)
     {
@@ -1555,10 +1703,14 @@ done:
             char_set_write_status(ch, COREBTH_SUCCESS);
         }
         ch->write_completed_gen = ch->write_generation;
-        dispatch_semaphore_signal(ch->pending_write);
+        should_signal = YES;
     }
 
-    pthread_mutex_unlock(&self.ctx->service_list_mutex);
+    pthread_mutex_unlock(&ch->mutex);
+
+    if (should_signal)
+        dispatch_semaphore_signal(write_sem);
+
     corebth_char_release(ch);
 }
 
@@ -1566,19 +1718,24 @@ done:
 {
     if (!self.ctx) return;
 
-    pthread_mutex_lock(&self.ctx->service_list_mutex);
+    pthread_mutex_lock(&self.ctx->list_mutex);
     struct corebth_char_entry *ch = corebth_find_char_by_cb(self.ctx, characteristic);
     if (!ch) {
-        pthread_mutex_unlock(&self.ctx->service_list_mutex);
+        pthread_mutex_unlock(&self.ctx->list_mutex);
         return;
     }
     corebth_char_retain(ch);
+    pthread_mutex_lock(&ch->mutex);
+    pthread_mutex_unlock(&self.ctx->list_mutex);
 
     if (char_is_invalidated(ch)) {
-        pthread_mutex_unlock(&self.ctx->service_list_mutex);
+        pthread_mutex_unlock(&ch->mutex);
         corebth_char_release(ch);
         return;
     }
+
+    dispatch_semaphore_t write_sem = ch->pending_write;
+    BOOL should_signal = NO;
 
     if (char_get_write_status(ch) == COREBTH_PENDING)
     {
@@ -1593,10 +1750,14 @@ done:
             char_set_write_status(ch, COREBTH_SUCCESS);
         }
         ch->write_completed_gen = ch->write_generation;
-        dispatch_semaphore_signal(ch->pending_write);
+        should_signal = YES;
     }
 
-    pthread_mutex_unlock(&self.ctx->service_list_mutex);
+    pthread_mutex_unlock(&ch->mutex);
+
+    if (should_signal)
+        dispatch_semaphore_signal(write_sem);
+
     corebth_char_release(ch);
 }
 
@@ -1611,8 +1772,7 @@ void *corebth_init( void )
     if (!ctx) return NULL;
 
     pthread_mutex_init( &ctx->event_mutex, NULL );
-    pthread_mutex_init( &ctx->peripheral_mutex, NULL );
-    pthread_mutex_init( &ctx->service_list_mutex, NULL );
+    pthread_mutex_init( &ctx->list_mutex, NULL );
     ctx->event_head = NULL;
     ctx->event_tail = NULL;
     ctx->peripherals = NULL;
@@ -1686,7 +1846,7 @@ void corebth_free( void *connection )
     ctx->event_tail = NULL;
     pthread_mutex_unlock(&ctx->event_mutex);
 
-    pthread_mutex_lock(&ctx->peripheral_mutex);
+    pthread_mutex_lock(&ctx->list_mutex);
     peripheral = ctx->peripherals;
     while (peripheral) {
         next_peripheral = peripheral->next;
@@ -1710,9 +1870,9 @@ void corebth_free( void *connection )
         ctx->uuid_map.buckets[i] = NULL;
     }
     ctx->peripherals = NULL;
-    pthread_mutex_unlock(&ctx->peripheral_mutex);
+    pthread_mutex_unlock(&ctx->list_mutex);
 
-    pthread_mutex_lock(&ctx->service_list_mutex);
+    pthread_mutex_lock(&ctx->list_mutex);
     struct corebth_char_entry *ch = ctx->characteristics;
     while (ch) {
         struct corebth_char_entry *next = ch->next_global;
@@ -1729,7 +1889,7 @@ void corebth_free( void *connection )
     }
     ctx->services = NULL;
     ctx->characteristics = NULL;
-    pthread_mutex_unlock(&ctx->service_list_mutex);
+    pthread_mutex_unlock(&ctx->list_mutex);
 
     if (ctx->bt_queue)
         dispatch_release( ctx->bt_queue );
@@ -1738,8 +1898,7 @@ void corebth_free( void *connection )
         CFRelease((__bridge CFTypeRef)ctx->central_delegate);
 
     pthread_mutex_destroy( &ctx->event_mutex );
-    pthread_mutex_destroy( &ctx->peripheral_mutex );
-    pthread_mutex_destroy( &ctx->service_list_mutex );
+    pthread_mutex_destroy( &ctx->list_mutex );
 
     if (global_context == ctx)
         global_context = NULL;
@@ -1857,14 +2016,18 @@ corebth_status corebth_device_start_pairing( void *connection, void *watcher_ctx
     if (!ctx || !device_name || !device_name->str)
         return COREBTH_NOT_SUPPORTED;
 
-    pthread_mutex_lock(&ctx->peripheral_mutex);
+    pthread_mutex_lock(&ctx->list_mutex);
     entry = corebth_find_peripheral_by_name(ctx, device_name);
 
     if (!entry || !entry->peripheral)
     {
-        pthread_mutex_unlock(&ctx->peripheral_mutex);
+        pthread_mutex_unlock(&ctx->list_mutex);
         return COREBTH_NOT_SUPPORTED;
     }
+
+    corebth_peripheral_retain(entry);
+    pthread_mutex_lock(&entry->mutex);
+    pthread_mutex_unlock(&ctx->list_mutex);
 
     peripheral_to_connect = entry->peripheral;
     services_sem = entry->services_discovered;
@@ -1873,7 +2036,8 @@ corebth_status corebth_device_start_pairing( void *connection, void *watcher_ctx
 
     if (already_discovered)
     {
-        pthread_mutex_unlock(&ctx->peripheral_mutex);
+        pthread_mutex_unlock(&entry->mutex);
+        corebth_peripheral_release(entry);
         return COREBTH_SUCCESS;
     }
 
@@ -1887,7 +2051,7 @@ corebth_status corebth_device_start_pairing( void *connection, void *watcher_ctx
             [ctx->central_manager connectPeripheral:peripheral_to_connect options:nil];
     }
 
-    pthread_mutex_unlock(&ctx->peripheral_mutex);
+    pthread_mutex_unlock(&entry->mutex);
 
     /* Wait for service discovery to complete (max 10 seconds - some services may not respond) */
 
@@ -1895,6 +2059,7 @@ corebth_status corebth_device_start_pairing( void *connection, void *watcher_ctx
     long result = dispatch_semaphore_wait(services_sem, timeout);
     (void)result;  /* Proceed whether services were discovered or timed out */
 
+    corebth_peripheral_release(entry);
     return COREBTH_SUCCESS;
 }
 
@@ -1920,82 +2085,62 @@ corebth_status corebth_characteristic_read( void *connection, const char *char_p
     CBPeripheral *peripheral;
     CBCharacteristic *characteristic;
 
-
+    NSLog(@"corebth_characteristic_read: ENTRY path=%s ctx=%p buffer=%p buf_size=%u len=%p",
+          char_path ? char_path : "(null)", ctx, buffer, buffer_size, len);
 
     if (!ctx || !buffer || !len) {
-
+        NSLog(@"corebth_characteristic_read: invalid params - ctx=%p buffer=%p len=%p", ctx, buffer, len);
         return COREBTH_NOT_SUPPORTED;
     }
 
-
-    pthread_mutex_lock(&ctx->service_list_mutex);
-
+    NSLog(@"corebth_characteristic_read: about to lock list_mutex...");
+    pthread_mutex_lock(&ctx->list_mutex);
+    NSLog(@"corebth_characteristic_read: list_mutex acquired");
     ch = corebth_find_char_by_path(ctx, char_path);
-
     if (!ch) {
-
-        pthread_mutex_unlock(&ctx->service_list_mutex);
+        pthread_mutex_unlock(&ctx->list_mutex);
         return COREBTH_NOT_SUPPORTED;
     }
+    corebth_char_retain(ch);
+    pthread_mutex_lock(&ch->mutex);
+    pthread_mutex_unlock(&ctx->list_mutex);
 
-
-    if (!ch->service) {
-
-        pthread_mutex_unlock(&ctx->service_list_mutex);
+    if (!ch->service || !ch->service->peripheral || !ch->service->peripheral->peripheral || !ch->characteristic || !ch->pending_read) {
+        pthread_mutex_unlock(&ch->mutex);
+        corebth_char_release(ch);
         return COREBTH_NOT_SUPPORTED;
-    }
-
-    if (!ch->service->peripheral) {
-
-        pthread_mutex_unlock(&ctx->service_list_mutex);
-        return COREBTH_NOT_SUPPORTED;
-    }
-
-    if (!ch->service->peripheral->peripheral) {
-
-        pthread_mutex_unlock(&ctx->service_list_mutex);
-        return COREBTH_NOT_SUPPORTED;
-    }
-
-    if (!ch->characteristic) {
-
-        pthread_mutex_unlock(&ctx->service_list_mutex);
-        return COREBTH_NOT_SUPPORTED;
-    }
-
-    if (!ch->pending_read) {
-
-        pthread_mutex_unlock(&ctx->service_list_mutex);
-        return COREBTH_INTERNAL_ERROR;
     }
 
     peripheral = ch->service->peripheral->peripheral;
     characteristic = ch->characteristic;
 
     if (peripheral.state != CBPeripheralStateConnected) {
-
-        pthread_mutex_unlock(&ctx->service_list_mutex);
+        pthread_mutex_unlock(&ch->mutex);
+        corebth_char_release(ch);
         return COREBTH_DEVICE_NOT_READY;
     }
 
     if (ch->cached_value_valid && ch->cached_value && ch->cached_value_len > 0) {
         unsigned int to_copy = MIN(buffer_size, ch->cached_value_len);
 
-        memcpy(buffer, ch->cached_value, to_copy);
-        *len = to_copy;
-        ch->cached_value_valid = FALSE;
-        pthread_mutex_unlock(&ctx->service_list_mutex);
+        if (to_copy > 0)
+            memcpy(buffer, ch->cached_value, to_copy);
+        *len = ch->cached_value_len;
+        if (to_copy >= ch->cached_value_len)
+            ch->cached_value_valid = FALSE;
+        pthread_mutex_unlock(&ch->mutex);
+        corebth_char_release(ch);
         return COREBTH_SUCCESS;
     }
 
-    uint32_t my_gen = ++ch->read_generation;
+    uint32_t my_gen;
+    my_gen = ++ch->read_generation;
     ch->read_completed_gen = 0;
     char_set_read_status(ch, COREBTH_PENDING);
     ch->pending_read_actual_len = 0;
     sem = ch->pending_read;
-    corebth_char_retain(ch);
 
-    pthread_mutex_unlock(&ctx->service_list_mutex);
+    pthread_mutex_unlock(&ch->mutex);
 
     @autoreleasepool {
         /* IMPORTANT: CoreBluetooth requires peripheral methods to be called from the same queue
@@ -2022,34 +2167,41 @@ corebth_status corebth_characteristic_read( void *connection, const char *char_p
         NSLog(@"corebth_characteristic_read: calling readValueForCharacteristic for char=%p peripheral=%p delegate=%p",
             (__bridge void *)characteristic, (__bridge void *)peripheral, (__bridge void *)peripheral.delegate);
 
+        __block CFAbsoluteTime dispatch_start = CFAbsoluteTimeGetCurrent();
         dispatch_sync(ctx->bt_queue, ^{
+            CFAbsoluteTime block_start = CFAbsoluteTimeGetCurrent();
+            NSLog(@"corebth_characteristic_read: bt_queue block started (waited %.3f ms for queue)",
+                (block_start - dispatch_start) * 1000.0);
             @try {
-                /* CRITICAL: Set this flag ON bt_queue right before the read call.
-                 * Since bt_queue is serial, the callback cannot run until this block completes.
-                 * This ensures the callback will see read_awaiting_response=YES and know
-                 * this is a read response, not a notification. */
                 ch->read_awaiting_response = YES;
-                NSLog(@"corebth_characteristic_read: dispatched to bt_queue, calling read NOW");
+                NSLog(@"corebth_characteristic_read: calling [peripheral readValueForCharacteristic:] NOW");
                 [peripheral readValueForCharacteristic:characteristic];
-                NSLog(@"corebth_characteristic_read: readValueForCharacteristic returned");
+                CFAbsoluteTime after_read = CFAbsoluteTimeGetCurrent();
+                NSLog(@"corebth_characteristic_read: readValueForCharacteristic returned (took %.3f ms)",
+                    (after_read - block_start) * 1000.0);
             }
             @catch (NSException *exception) {
                 NSLog(@"corebth_characteristic_read: exception: %@", [exception description]);
                 ch->read_awaiting_response = NO;
-                pthread_mutex_lock(&ctx->service_list_mutex);
+                pthread_mutex_lock(&ch->mutex);
                 char_set_read_status(ch, COREBTH_INTERNAL_ERROR);
                 ch->read_completed_gen = my_gen;
-                pthread_mutex_unlock(&ctx->service_list_mutex);
+                pthread_mutex_unlock(&ch->mutex);
                 dispatch_semaphore_signal(sem);
             }
         });
     }
 
 
+    CFAbsoluteTime wait_start = CFAbsoluteTimeGetCurrent();
+    NSLog(@"corebth_characteristic_read: starting semaphore wait (5 second timeout)");
     timeout = dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC);
-    dispatch_semaphore_wait(sem, timeout);
+    long wait_result = dispatch_semaphore_wait(sem, timeout);
+    CFAbsoluteTime wait_end = CFAbsoluteTimeGetCurrent();
+    NSLog(@"corebth_characteristic_read: semaphore wait returned %s after %.3f ms",
+        wait_result == 0 ? "SUCCESS (signaled)" : "TIMEOUT", (wait_end - wait_start) * 1000.0);
 
-    pthread_mutex_lock(&ctx->service_list_mutex);
+    pthread_mutex_lock(&ch->mutex);
 
     if (ch->read_completed_gen == my_gen) {
         uint32_t result_len = ch->pending_read_actual_len;
@@ -2058,9 +2210,10 @@ corebth_status corebth_characteristic_read( void *connection, const char *char_p
             memcpy(buffer, ch->pending_read_internal_buffer, result_len);
             *len = result_len;
         } else if (result_len > buffer_size) {
-            /* Data larger than buffer - copy what fits */
+            /* Data larger than buffer - copy what fits, but return actual length
+             * so caller knows the full size (important for size queries where buffer_size=0) */
             memcpy(buffer, ch->pending_read_internal_buffer, buffer_size);
-            *len = buffer_size;
+            *len = result_len;
         } else {
             *len = 0;
         }
@@ -2080,7 +2233,7 @@ corebth_status corebth_characteristic_read( void *connection, const char *char_p
             unsigned int to_copy = MIN(buffer_size, (unsigned int)cachedData.length);
 
             memcpy(buffer, cachedData.bytes, to_copy);
-            *len = to_copy;
+            *len = (unsigned int)cachedData.length;  /* Return actual length for size queries */
             status = COREBTH_SUCCESS;
         } else {
             *len = 0;
@@ -2088,7 +2241,7 @@ corebth_status corebth_characteristic_read( void *connection, const char *char_p
         }
     }
 
-    pthread_mutex_unlock(&ctx->service_list_mutex);
+    pthread_mutex_unlock(&ch->mutex);
     corebth_char_release(ch);
     return status;
 }
@@ -2101,35 +2254,39 @@ corebth_status corebth_characteristic_write( void *connection, const char *char_
     struct corebth_char_entry *ch;
     dispatch_time_t timeout;
     dispatch_semaphore_t sem;
-    CBCharacteristicWriteType cb_type = (write_type == 0) ? CBCharacteristicWriteWithResponse
-                                                          : CBCharacteristicWriteWithoutResponse;
+    CBCharacteristicWriteType cb_type;
     CBPeripheral *peripheral;
     CBCharacteristic *characteristic;
     NSUInteger max_write_len;
     long wait_result;
     corebth_status status;
     BOOL write_without_response = NO;
+    BOOL supports_write_with_response;
+    BOOL supports_write_without_response;
 
     if (!ctx || !value) {
         return COREBTH_NOT_SUPPORTED;
     }
 
-    pthread_mutex_lock(&ctx->service_list_mutex);
+    pthread_mutex_lock(&ctx->list_mutex);
     ch = corebth_find_char_by_path(ctx, char_path);
     if (!ch || !ch->service || !ch->service->peripheral || !ch->service->peripheral->peripheral) {
-        pthread_mutex_unlock(&ctx->service_list_mutex);
+        pthread_mutex_unlock(&ctx->list_mutex);
         return COREBTH_NOT_SUPPORTED;
     }
+    corebth_char_retain(ch);
+    pthread_mutex_lock(&ch->mutex);
+    pthread_mutex_unlock(&ctx->list_mutex);
 
     peripheral = ch->service->peripheral->peripheral;
     characteristic = ch->characteristic;
 
-    uint32_t my_gen = ++ch->write_generation;
+    uint32_t my_gen;
+    my_gen = ++ch->write_generation;
     ch->write_completed_gen = 0;
     char_set_write_status(ch, COREBTH_PENDING);
     sem = ch->pending_write;
-    corebth_char_retain(ch);
-    pthread_mutex_unlock(&ctx->service_list_mutex);
+    pthread_mutex_unlock(&ch->mutex);
 
     @autoreleasepool {
         NSData *data = [NSData dataWithBytes:value length:len];
@@ -2146,6 +2303,25 @@ corebth_status corebth_characteristic_write( void *connection, const char *char_
             corebth_char_release(ch);
             return COREBTH_DEVICE_NOT_READY;
         }
+
+        supports_write_with_response = (characteristic.properties & CBCharacteristicPropertyWrite) != 0;
+        supports_write_without_response = (characteristic.properties & CBCharacteristicPropertyWriteWithoutResponse) != 0;
+
+        if (!supports_write_with_response && !supports_write_without_response) {
+            char_set_write_status(ch, COREBTH_INVALID_PARAMETER);
+            dispatch_semaphore_signal(sem);
+            corebth_char_release(ch);
+            return COREBTH_INVALID_PARAMETER;
+        }
+
+        if (write_type == 0 && supports_write_with_response) {
+            cb_type = CBCharacteristicWriteWithResponse;
+        } else if (supports_write_without_response) {
+            cb_type = CBCharacteristicWriteWithoutResponse;
+        } else {
+            cb_type = CBCharacteristicWriteWithResponse;
+        }
+
         max_write_len = [peripheral maximumWriteValueLengthForType:cb_type];
 
         if (len > max_write_len) {
@@ -2154,16 +2330,7 @@ corebth_status corebth_characteristic_write( void *connection, const char *char_
             corebth_char_release(ch);
             return COREBTH_INVALID_PARAMETER;
         }
-        if ((characteristic.properties & CBCharacteristicPropertyWrite) == 0 &&
-            (characteristic.properties & CBCharacteristicPropertyWriteWithoutResponse) == 0) {
-            char_set_write_status(ch, COREBTH_INVALID_PARAMETER);
-            dispatch_semaphore_signal(sem);
-            corebth_char_release(ch);
-            return COREBTH_INVALID_PARAMETER;
-        }
 
-        /* IMPORTANT: CoreBluetooth requires peripheral methods to be called from the same queue
-         * that the CBCentralManager was created with. Dispatch to bt_queue. */
         CBCharacteristic *char_to_write = characteristic;
         dispatch_async(ctx->bt_queue, ^{
             @try {
@@ -2174,10 +2341,10 @@ corebth_status corebth_characteristic_write( void *connection, const char *char_
             }
             @catch (NSException *exception) {
 
-                pthread_mutex_lock(&ctx->service_list_mutex);
+                pthread_mutex_lock(&ch->mutex);
                 char_set_write_status(ch, COREBTH_INTERNAL_ERROR);
                 ch->write_completed_gen = my_gen;
-                pthread_mutex_unlock(&ctx->service_list_mutex);
+                pthread_mutex_unlock(&ch->mutex);
                 dispatch_semaphore_signal(sem);
             }
         });
@@ -2195,13 +2362,13 @@ corebth_status corebth_characteristic_write( void *connection, const char *char_
     timeout = dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC);
     wait_result = dispatch_semaphore_wait(sem, timeout);
 
-    pthread_mutex_lock(&ctx->service_list_mutex);
+    pthread_mutex_lock(&ch->mutex);
     if (ch->write_completed_gen == my_gen) {
         status = char_get_write_status(ch);
     } else {
         status = COREBTH_TIMEOUT;
     }
-    pthread_mutex_unlock(&ctx->service_list_mutex);
+    pthread_mutex_unlock(&ch->mutex);
 
     corebth_char_release(ch);
     return status;
@@ -2217,19 +2384,21 @@ corebth_status corebth_characteristic_set_notify( void *connection, const char *
 
     if (!ctx) return COREBTH_NOT_SUPPORTED;
 
-    pthread_mutex_lock(&ctx->service_list_mutex);
+    pthread_mutex_lock(&ctx->list_mutex);
     ch = corebth_find_char_by_path(ctx, char_path);
     if (!ch || !ch->service || !ch->service->peripheral || !ch->service->peripheral->peripheral) {
-        pthread_mutex_unlock(&ctx->service_list_mutex);
+        pthread_mutex_unlock(&ctx->list_mutex);
         return COREBTH_NOT_SUPPORTED;
     }
+    corebth_char_retain(ch);
+    pthread_mutex_lock(&ch->mutex);
+    pthread_mutex_unlock(&ctx->list_mutex);
 
     peripheral = ch->service->peripheral->peripheral;
     characteristic = ch->characteristic;
 
     ch->notifications_enabled = enable ? TRUE : FALSE;
-    corebth_char_retain(ch);
-    pthread_mutex_unlock(&ctx->service_list_mutex);
+    pthread_mutex_unlock(&ch->mutex);
 
     /* IMPORTANT: CoreBluetooth requires peripheral methods to be called from the same queue
      * that the CBCentralManager was created with. Dispatch to bt_queue. */
@@ -2260,16 +2429,16 @@ corebth_status corebth_characteristic_read_notification( void *connection, const
     if (!buffer || !size) return COREBTH_INVALID_PARAMETER;
 
 
-    pthread_mutex_lock(&ctx->service_list_mutex);
+    pthread_mutex_lock(&ctx->list_mutex);
 
     ch = corebth_find_char_by_path(ctx, char_path);
     if (!ch) {
-        pthread_mutex_unlock(&ctx->service_list_mutex);
+        pthread_mutex_unlock(&ctx->list_mutex);
 
         return COREBTH_NOT_SUPPORTED;
     }
     corebth_char_retain(ch);
-    pthread_mutex_unlock(&ctx->service_list_mutex);
+    pthread_mutex_unlock(&ctx->list_mutex);
 
 
     timeout = dispatch_time(DISPATCH_TIME_NOW, 5LL * NSEC_PER_SEC);
@@ -2282,7 +2451,7 @@ corebth_status corebth_characteristic_read_notification( void *connection, const
         return COREBTH_TIMEOUT;
     }
 
-    pthread_mutex_lock(&ch->notification_mutex);
+    pthread_mutex_lock(&ch->mutex);
     notif_entry = ch->notification_queue_head;
     if (notif_entry) {
         ch->notification_queue_head = notif_entry->next;
@@ -2290,7 +2459,7 @@ corebth_status corebth_characteristic_read_notification( void *connection, const
             ch->notification_queue_tail = NULL;
         }
     }
-    pthread_mutex_unlock(&ch->notification_mutex);
+    pthread_mutex_unlock(&ch->mutex);
 
     if (notif_entry) {
         unsigned int to_copy = MIN(buffer_size, notif_entry->data_len);
