@@ -1016,14 +1016,24 @@ NTSTATUS WINAPI IoSetDeviceInterfaceState( UNICODE_STRING *name, BOOLEAN enable 
 
     lstrcpyW( path, DeviceClassesW );
     lstrcpynW( path + lstrlenW( path ), refstr - 38, 39 );
+    {
+        WCHAR *q;
+        for (q = path + lstrlenW(DeviceClassesW); *q; q++)
+            if (*q >= 'a' && *q <= 'z') *q -= 'a' - 'A';
+    }
     lstrcatW( path, slashW );
     p = path + lstrlenW( path );
     lstrcpynW( path + lstrlenW( path ), name->Buffer, (refstr - name->Buffer) + 1 );
     p[0] = p[1] = p[3] = '#';
+    {
+        WCHAR *q;
+        for (q = p; *q; q++)
+            if (*q >= 'a' && *q <= 'z') *q -= 'a' - 'A';
+    }
     lstrcatW( path, slashW );
     lstrcatW( path, hashW );
     if (refstr < name->Buffer + namelen)
-        lstrcpynW( path + lstrlenW( path ), refstr, name->Buffer + namelen - refstr + 1 );
+        lstrcpynW( path + lstrlenW( path ), refstr + 1, name->Buffer + namelen - refstr );
 
     attr.Length = sizeof(attr);
     attr.ObjectName = &string;
@@ -1054,9 +1064,14 @@ NTSTATUS WINAPI IoSetDeviceInterfaceState( UNICODE_STRING *name, BOOLEAN enable 
         ret = IoDeleteSymbolicLink( name );
     if (ret)
     {
-        NtDeleteValueKey( control_key, &linked );
-        NtClose( control_key );
-        return ret;
+        if (ret == STATUS_OBJECT_PATH_NOT_FOUND)
+            ret = STATUS_SUCCESS;
+        else
+        {
+            NtDeleteValueKey( control_key, &linked );
+            NtClose( control_key );
+            return ret;
+        }
     }
 
     iface->enabled = enable;

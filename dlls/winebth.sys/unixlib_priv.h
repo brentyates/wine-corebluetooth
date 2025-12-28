@@ -65,4 +65,53 @@ extern NTSTATUS bluez_device_disconnect( void *connection, const char *device_pa
 extern NTSTATUS bluez_device_start_pairing( void *dbus_connection, void *watcher_ctx, struct unix_name *device, IRP *irp );
 extern NTSTATUS bluez_watcher_init( void *connection, void **ctx );
 extern void bluez_watcher_close( void *connection, void *ctx );
+
+#ifdef __APPLE__
+typedef int32_t corebth_status;
+#define COREBTH_SUCCESS            0
+#define COREBTH_NOT_SUPPORTED      ((corebth_status)0xC00000BB)
+#define COREBTH_PENDING            ((corebth_status)0x00000103)
+#define COREBTH_DEVICE_NOT_READY   ((corebth_status)0xC00000A3)
+#define COREBTH_INTERNAL_ERROR     ((corebth_status)0xC00000E5)
+#define COREBTH_INVALID_PARAMETER  ((corebth_status)0xC000000D)
+#define COREBTH_TIMEOUT            ((corebth_status)0x00000102)
+extern void *corebth_init( void );
+extern void corebth_close( void *connection );
+extern void corebth_free( void *connection );
+extern corebth_status corebth_loop( void *connection, void *watcher_ctx, void *auth_agent,
+                                    void *result );
+extern corebth_status corebth_adapter_set_prop( void *connection, void *params );
+extern corebth_status corebth_adapter_start_discovery( void *connection, const char *adapter_path );
+extern corebth_status corebth_adapter_stop_discovery( void *connection, const char *adapter_path );
+extern corebth_status corebth_adapter_remove_device( void *connection, const char *adapter_path,
+                                                     uint64_t device_handle );
+extern corebth_status corebth_auth_agent_request_default( void *connection );
+extern corebth_status corebth_auth_agent_start( void *connection, void **ctx );
+extern void corebth_auth_agent_stop( void *connection, void *ctx );
+extern corebth_status corebth_auth_agent_send_response( void *auth_agent, uint64_t device_handle,
+                                                        int method, unsigned int numeric_or_passkey,
+                                                        int negative, int *authenticated );
+extern corebth_status corebth_device_disconnect( void *connection, uint64_t device_handle );
+extern corebth_status corebth_device_start_pairing( void *connection, void *watcher_ctx,
+                                                    uint64_t device_handle, void *irp );
+extern corebth_status corebth_watcher_init( void *connection, void **ctx );
+extern void corebth_watcher_close( void *connection, void *ctx );
+extern void corebth_service_release( void *svc );
+extern void corebth_char_release( void *ch );
+extern void corebth_char_retain( void *ch );
+extern void corebth_peripheral_retain( void *periph );
+extern void corebth_peripheral_release( void *periph );
+extern corebth_status corebth_characteristic_read( void *connection, uint64_t characteristic_handle,
+                                                   unsigned char *buffer, unsigned int buffer_size,
+                                                   unsigned int *size );
+extern corebth_status corebth_characteristic_write( void *connection, uint64_t characteristic_handle,
+                                                    const unsigned char *data, unsigned int size,
+                                                    int write_type );
+extern corebth_status corebth_characteristic_set_notify( void *connection, uint64_t characteristic_handle,
+                                                         int enable );
+extern corebth_status corebth_characteristic_read_notification( void *connection, uint64_t characteristic_handle,
+                                                                unsigned char *buffer, unsigned int buffer_size,
+                                                                unsigned int *size );
+#endif /* __APPLE__ */
+
 #endif /* __WINE_WINEBTH_UNIXLIB_PRIV_H */

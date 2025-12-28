@@ -32,13 +32,20 @@ HRESULT WINAPI DllGetActivationFactory( HSTRING classid, IActivationFactory **fa
 {
     const WCHAR *buffer = WindowsGetStringRawBuffer( classid, NULL );
 
-    TRACE( "class %s, factory %p.\n", debugstr_hstring( classid ), factory );
+    ERR( "=== DllGetActivationFactory REQUESTED: %s ===\n", debugstr_w( buffer ));
 
     *factory = NULL;
 
     if (!wcscmp( buffer, RuntimeClass_Windows_Storage_Streams_RandomAccessStreamReference ))
         IActivationFactory_QueryInterface( random_access_stream_reference_factory, &IID_IActivationFactory, (void **)factory );
 
-    if (*factory) return S_OK;
+    if (!wcscmp( buffer, RuntimeClass_Windows_Storage_Streams_DataReader ))
+        IActivationFactory_QueryInterface( data_reader_factory, &IID_IActivationFactory, (void **)factory );
+
+    if (*factory) {
+        ERR( "=== DllGetActivationFactory FOUND: %s ===\n", debugstr_w( buffer ));
+        return S_OK;
+    }
+    ERR( "=== DllGetActivationFactory NOT FOUND: %s ===\n", debugstr_w( buffer ));
     return CLASS_E_CLASSNOTAVAILABLE;
 }

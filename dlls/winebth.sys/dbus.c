@@ -1708,7 +1708,7 @@ static DBusHandlerResult bluez_filter( DBusConnection *conn, DBusMessage *msg, v
                     ERR( "Failed to allocate memory for GATT characteristic path %s\n", debugstr_a( object_path ) );
                     continue;
                 }
-                event.gatt_characterisic_removed.handle = (UINT_PTR)chrc;
+                event.gatt_characteristic_removed.handle = (UINT_PTR)chrc;
                 if (!bluez_event_list_queue_new_event( event_list, BLUETOOTH_WATCHER_EVENT_TYPE_GATT_CHARACTERISTIC_REMOVED,
                                                        event ))
                     unix_name_free( chrc );
@@ -1962,7 +1962,7 @@ static void bluez_watcher_free( struct bluez_watcher_ctx *watcher )
             unix_name_free( (struct unix_name *)event1->event.gatt_characteristic_added.service.handle );
             break;
         case BLUETOOTH_WATCHER_EVENT_TYPE_GATT_CHARACTERISTIC_REMOVED:
-            unix_name_free( (struct unix_name *)event1->event.gatt_characterisic_removed.handle );
+            unix_name_free( (struct unix_name *)event1->event.gatt_characteristic_removed.handle );
             break;
         }
         free( event1 );

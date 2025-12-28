@@ -33,6 +33,189 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(crypto);
 
+struct crypto_buffer
+{
+    IBuffer IBuffer_iface;
+    IBufferByteAccess IBufferByteAccess_iface;
+    LONG refcount;
+    UINT32 length;
+    UINT32 capacity;
+    BYTE *data;
+};
+
+static inline struct crypto_buffer *impl_from_IBuffer( IBuffer *iface )
+{
+    return CONTAINING_RECORD( iface, struct crypto_buffer, IBuffer_iface );
+}
+
+static inline struct crypto_buffer *impl_from_IBufferByteAccess( IBufferByteAccess *iface )
+{
+    return CONTAINING_RECORD( iface, struct crypto_buffer, IBufferByteAccess_iface );
+}
+
+static HRESULT WINAPI crypto_buffer_QueryInterface( IBuffer *iface, REFIID iid, void **out )
+{
+    struct crypto_buffer *impl = impl_from_IBuffer( iface );
+
+    TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid(iid), out );
+
+    if (IsEqualGUID( iid, &IID_IUnknown ) ||
+        IsEqualGUID( iid, &IID_IInspectable ) ||
+        IsEqualGUID( iid, &IID_IBuffer ))
+    {
+        IBuffer_AddRef( &impl->IBuffer_iface );
+        *out = &impl->IBuffer_iface;
+        return S_OK;
+    }
+
+    if (IsEqualGUID( iid, &IID_IBufferByteAccess ))
+    {
+        IBufferByteAccess_AddRef( &impl->IBufferByteAccess_iface );
+        *out = &impl->IBufferByteAccess_iface;
+        return S_OK;
+    }
+
+    WARN( "%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(iid) );
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+
+static ULONG WINAPI crypto_buffer_AddRef( IBuffer *iface )
+{
+    struct crypto_buffer *impl = impl_from_IBuffer( iface );
+    ULONG refcount = InterlockedIncrement( &impl->refcount );
+    TRACE( "iface %p, refcount %lu.\n", iface, refcount );
+    return refcount;
+}
+
+static ULONG WINAPI crypto_buffer_Release( IBuffer *iface )
+{
+    struct crypto_buffer *impl = impl_from_IBuffer( iface );
+    ULONG refcount = InterlockedDecrement( &impl->refcount );
+    TRACE( "iface %p, refcount %lu.\n", iface, refcount );
+    if (!refcount)
+    {
+        free( impl->data );
+        free( impl );
+    }
+    return refcount;
+}
+
+static HRESULT WINAPI crypto_buffer_GetIids( IBuffer *iface, ULONG *iid_count, IID **iids )
+{
+    FIXME( "iface %p, iid_count %p, iids %p stub!\n", iface, iid_count, iids );
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI crypto_buffer_GetRuntimeClassName( IBuffer *iface, HSTRING *class_name )
+{
+    FIXME( "iface %p, class_name %p stub!\n", iface, class_name );
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI crypto_buffer_GetTrustLevel( IBuffer *iface, TrustLevel *level )
+{
+    FIXME( "iface %p, level %p stub!\n", iface, level );
+    return E_NOTIMPL;
+}
+
+static HRESULT WINAPI crypto_buffer_get_Capacity( IBuffer *iface, UINT32 *value )
+{
+    struct crypto_buffer *impl = impl_from_IBuffer( iface );
+    TRACE( "iface %p, value %p.\n", iface, value );
+    *value = impl->capacity;
+    return S_OK;
+}
+
+static HRESULT WINAPI crypto_buffer_get_Length( IBuffer *iface, UINT32 *value )
+{
+    struct crypto_buffer *impl = impl_from_IBuffer( iface );
+    TRACE( "iface %p, value %p.\n", iface, value );
+    *value = impl->length;
+    return S_OK;
+}
+
+static HRESULT WINAPI crypto_buffer_put_Length( IBuffer *iface, UINT32 value )
+{
+    struct crypto_buffer *impl = impl_from_IBuffer( iface );
+    TRACE( "iface %p, value %u.\n", iface, value );
+    if (value > impl->capacity) return E_INVALIDARG;
+    impl->length = value;
+    return S_OK;
+}
+
+static const IBufferVtbl crypto_buffer_vtbl =
+{
+    crypto_buffer_QueryInterface,
+    crypto_buffer_AddRef,
+    crypto_buffer_Release,
+    crypto_buffer_GetIids,
+    crypto_buffer_GetRuntimeClassName,
+    crypto_buffer_GetTrustLevel,
+    crypto_buffer_get_Capacity,
+    crypto_buffer_get_Length,
+    crypto_buffer_put_Length,
+};
+
+static HRESULT WINAPI crypto_buffer_byte_access_QueryInterface( IBufferByteAccess *iface, REFIID iid, void **out )
+{
+    struct crypto_buffer *impl = impl_from_IBufferByteAccess( iface );
+    return crypto_buffer_QueryInterface( &impl->IBuffer_iface, iid, out );
+}
+
+static ULONG WINAPI crypto_buffer_byte_access_AddRef( IBufferByteAccess *iface )
+{
+    struct crypto_buffer *impl = impl_from_IBufferByteAccess( iface );
+    return crypto_buffer_AddRef( &impl->IBuffer_iface );
+}
+
+static ULONG WINAPI crypto_buffer_byte_access_Release( IBufferByteAccess *iface )
+{
+    struct crypto_buffer *impl = impl_from_IBufferByteAccess( iface );
+    return crypto_buffer_Release( &impl->IBuffer_iface );
+}
+
+static HRESULT WINAPI crypto_buffer_byte_access_Buffer( IBufferByteAccess *iface, BYTE **value )
+{
+    struct crypto_buffer *impl = impl_from_IBufferByteAccess( iface );
+    TRACE( "iface %p, value %p.\n", iface, value );
+    *value = impl->data;
+    return S_OK;
+}
+
+static const IBufferByteAccessVtbl crypto_buffer_byte_access_vtbl =
+{
+    crypto_buffer_byte_access_QueryInterface,
+    crypto_buffer_byte_access_AddRef,
+    crypto_buffer_byte_access_Release,
+    crypto_buffer_byte_access_Buffer,
+};
+
+static HRESULT create_crypto_buffer( UINT32 size, const BYTE *data, IBuffer **out )
+{
+    struct crypto_buffer *impl;
+
+    if (!(impl = calloc( 1, sizeof(*impl) ))) return E_OUTOFMEMORY;
+    if (size > 0)
+    {
+        if (!(impl->data = malloc( size )))
+        {
+            free( impl );
+            return E_OUTOFMEMORY;
+        }
+        if (data) memcpy( impl->data, data, size );
+    }
+
+    impl->IBuffer_iface.lpVtbl = &crypto_buffer_vtbl;
+    impl->IBufferByteAccess_iface.lpVtbl = &crypto_buffer_byte_access_vtbl;
+    impl->refcount = 1;
+    impl->length = size;
+    impl->capacity = size;
+
+    *out = &impl->IBuffer_iface;
+    return S_OK;
+}
+
 struct cryptobuffer_factory
 {
     IActivationFactory IActivationFactory_iface;
@@ -165,17 +348,44 @@ static HRESULT STDMETHODCALLTYPE cryptobuffer_statics_GenerateRandomNumber(
 static HRESULT STDMETHODCALLTYPE cryptobuffer_statics_CreateFromByteArray(
         ICryptographicBufferStatics *iface, UINT32 value_size, BYTE *value, IBuffer **buffer)
 {
-    FIXME("iface %p, value_size %u, value %p, buffer %p stub!\n", iface, value_size, value, buffer);
+    TRACE("iface %p, value_size %u, value %p, buffer %p.\n", iface, value_size, value, buffer);
 
-    return E_NOTIMPL;
+    if (!buffer) return E_INVALIDARG;
+    return create_crypto_buffer( value_size, value, buffer );
 }
 
 static HRESULT STDMETHODCALLTYPE cryptobuffer_statics_CopyToByteArray(
         ICryptographicBufferStatics *iface, IBuffer *buffer, UINT32 *value_size, BYTE **value)
 {
-    FIXME("iface %p, buffer %p, value_size %p, value %p stub!\n", iface, buffer, value_size, value);
+    IBufferByteAccess *byte_access;
+    BYTE *src_data;
+    UINT32 length;
+    HRESULT hr;
 
-    return E_NOTIMPL;
+    TRACE("iface %p, buffer %p, value_size %p, value %p.\n", iface, buffer, value_size, value);
+
+    if (!value_size || !value) return E_INVALIDARG;
+
+    *value_size = 0;
+    *value = NULL;
+
+    if (!buffer) return S_OK;
+
+    if (FAILED(hr = IBuffer_get_Length( buffer, &length ))) return hr;
+    if (!length) return S_OK;
+
+    if (FAILED(hr = IBuffer_QueryInterface( buffer, &IID_IBufferByteAccess, (void **)&byte_access )))
+        return hr;
+
+    hr = IBufferByteAccess_Buffer( byte_access, &src_data );
+    IBufferByteAccess_Release( byte_access );
+    if (FAILED(hr)) return hr;
+
+    if (!(*value = CoTaskMemAlloc( length ))) return E_OUTOFMEMORY;
+
+    memcpy( *value, src_data, length );
+    *value_size = length;
+    return S_OK;
 }
 
 static HRESULT STDMETHODCALLTYPE cryptobuffer_statics_DecodeFromHexString(

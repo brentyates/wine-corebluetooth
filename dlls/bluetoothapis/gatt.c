@@ -156,3 +156,98 @@ HRESULT WINAPI BluetoothGATTGetCharacteristics( HANDLE device, BTH_LE_GATT_SERVI
         return HRESULT_FROM_WIN32( ERROR_INVALID_USER_BUFFER );
     return S_OK;
 }
+
+HRESULT WINAPI BluetoothGATTGetCharacteristicValue( HANDLE device, PBTH_LE_GATT_CHARACTERISTIC characteristic,
+                                                     ULONG value_size, PBTH_LE_GATT_CHARACTERISTIC_VALUE value,
+                                                     USHORT *value_size_required, ULONG flags )
+{
+    struct winebth_le_device_read_characteristic_params *params;
+    DWORD size, bytes;
+
+    TRACE( "(%p, %p, %lu, %p, %p, %#lx)\n", device, characteristic, value_size, value, value_size_required, flags );
+
+    if (flags)
+        FIXME( "Unsupported flags: %#lx\n", flags );
+
+    if (!characteristic)
+        return E_INVALIDARG;
+
+    if (!value && !value_size_required)
+        return E_POINTER;
+
+    size = offsetof( struct winebth_le_device_read_characteristic_params, data ) + value_size;
+    params = calloc( 1, size );
+    if (!params)
+        return HRESULT_FROM_WIN32( ERROR_NO_SYSTEM_RESOURCES );
+
+    memset( &params->service, 0, sizeof(params->service) );
+    params->characteristic = *characteristic;
+    if (!DeviceIoControl( device, IOCTL_WINEBTH_LE_DEVICE_READ_CHARACTERISTIC, params, size, params, size, &bytes, NULL ))
+    {
+        HRESULT hr = HRESULT_FROM_WIN32( GetLastError() );
+        free( params );
+        return hr;
+    }
+
+    if (value_size_required)
+        *value_size_required = offsetof( BTH_LE_GATT_CHARACTERISTIC_VALUE, Data ) + params->data_size;
+
+    if (!value)
+    {
+        free( params );
+        return HRESULT_FROM_WIN32( ERROR_MORE_DATA );
+    }
+
+    if (value_size < offsetof( BTH_LE_GATT_CHARACTERISTIC_VALUE, Data ) + params->data_size)
+    {
+        free( params );
+        return HRESULT_FROM_WIN32( ERROR_INVALID_USER_BUFFER );
+    }
+
+    value->DataSize = params->data_size;
+    memcpy( value->Data, params->data, params->data_size );
+    free( params );
+    return S_OK;
+}
+
+HRESULT WINAPI BluetoothGATTSetCharacteristicValue( HANDLE device, PBTH_LE_GATT_CHARACTERISTIC characteristic,
+                                                     PBTH_LE_GATT_CHARACTERISTIC_VALUE value,
+                                                     BTH_LE_GATT_RELIABLE_WRITE_CONTEXT reliable_write_context,
+                                                     ULONG flags )
+{
+    struct winebth_le_device_write_characteristic_params *params;
+    DWORD size, bytes;
+    ULONG write_type = 0;
+
+    TRACE( "(%p, %p, %p, %I64u, %#lx)\n", device, characteristic, value, reliable_write_context, flags );
+
+    if (reliable_write_context)
+        FIXME( "Reliable write context not implemented\n" );
+
+    if (!characteristic || !value)
+        return E_INVALIDARG;
+
+    if (flags & BLUETOOTH_GATT_FLAG_WRITE_WITHOUT_RESPONSE)
+        write_type = 1;
+
+    size = offsetof( struct winebth_le_device_write_characteristic_params, data ) + value->DataSize;
+    params = calloc( 1, size );
+    if (!params)
+        return HRESULT_FROM_WIN32( ERROR_NO_SYSTEM_RESOURCES );
+
+    memset( &params->service, 0, sizeof(params->service) );
+    params->characteristic = *characteristic;
+    params->write_type = write_type;
+    params->data_size = value->DataSize;
+    memcpy( params->data, value->Data, value->DataSize );
+
+    if (!DeviceIoControl( device, IOCTL_WINEBTH_LE_DEVICE_WRITE_CHARACTERISTIC, params, size, NULL, 0, &bytes, NULL ))
+    {
+        HRESULT hr = HRESULT_FROM_WIN32( GetLastError() );
+        free( params );
+        return hr;
+    }
+
+    free( params );
+    return S_OK;
+}
